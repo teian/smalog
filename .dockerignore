@@ -1,0 +1,12 @@
+target
+.git
+docs
+*.md
+!Cargo.toml
+scratchpad
+smalog.db
+smalog.db-*
+# Web UI is a separate npm project; not needed for the Rust build.
+src/ui/node_modules
+src/ui/dist
+**/node_modules

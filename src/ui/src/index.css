@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* shadcn-style CSS variables (trimmed). Dark is the default theme. */
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --destructive: 0 72% 51%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 217 91% 60%;
+    --radius: 0.5rem;
+    --chart-1: 203 82% 45%;
+    --chart-2: 149 48% 55%;
+    --chart-3: 18 100% 59%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 190 80% 50%;
+  }
+
+  .dark {
+    --background: 222 47% 11%;
+    --foreground: 210 40% 98%;
+    --card: 222 45% 14%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222 45% 14%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 11%;
+    --secondary: 217 33% 20%;
+    --secondary-foreground: 210 40% 98%;
+    --destructive: 0 84% 60%;
+    --muted: 217 33% 20%;
+    --muted-foreground: 215 20% 65%;
+    --border: 217 33% 24%;
+    --input: 217 33% 24%;
+    --ring: 224 76% 60%;
+    --chart-1: 203 82% 45%;
+    --chart-2: 149 48% 55%;
+    --chart-3: 18 100% 59%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 190 80% 50%;
+  }
+
+  * {
+    border-color: hsl(var(--border));
+  }
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "smalog-storage"
+version = "0.1.0"
+edition = "2021"
+description = "Canonical schema, domain model, and database storage for smalog"
+license = "EUPL-1.2"
+rust-version = "1.85"
+
+[dependencies]
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres", "chrono", "migrate", "macros"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"

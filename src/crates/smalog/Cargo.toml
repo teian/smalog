@@ -1,0 +1,39 @@
+[package]
+name = "smalog"
+version = "0.1.0"
+edition = "2021"
+description = "smalog — SMA inverter logger"
+license = "EUPL-1.2"
+repository = "https://github.com/teian/smalog"
+rust-version = "1.85"
+
+[features]
+# Embed the built web UI (src/ui/dist) into the binary and serve it.
+# Enable for release builds after `pnpm run build` in src/ui.
+ui = ["dep:rust-embed"]
+
+[dependencies]
+smalog-connection = { path = "../smalog-connection" }
+smalog-sbfspot-migrator = { path = "../smalog-sbfspot-migrator" }
+smalog-storage = { path = "../smalog-storage" }
+axum = "0.8.1"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+clap = { version = "4.6.1", features = ["derive"] }
+rumqttc = "0.25.1"
+rust-embed = { version = "8.5.0", features = ["mime-guess"], optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tower-http = { version = "0.6.2", features = ["cors"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "net", "time", "signal", "fs", "io-util", "sync"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+
+[dev-dependencies]
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres", "chrono", "migrate", "macros"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }

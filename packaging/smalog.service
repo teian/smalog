@@ -1,0 +1,29 @@
+[Unit]
+Description=smalog — SMA Speedwire inverter logger
+Documentation=https://github.com/SBFspot/SBFspot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Create the user with: useradd --system --no-create-home smalog
+User=smalog
+Group=smalog
+ExecStart=/usr/local/bin/smalog --config /etc/smalog/config.toml run
+Restart=on-failure
+RestartSec=30
+
+# Secrets referenced as ${VAR} in config.toml (chmod 600, root-owned):
+EnvironmentFile=-/etc/smalog/smalog.env
+
+# Hardening.
+StateDirectory=smalog
+ProtectSystem=strict
+ReadWritePaths=/var/lib/smalog
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

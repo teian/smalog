@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "src/crates/smalog",
+    "src/crates/smalog-sbfspot-migrator",
+    "src/crates/smalog-schema-benchmark",
+    "src/crates/smalog-storage",
+    "src/crates/smalog-connection",
+]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

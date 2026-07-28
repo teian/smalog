@@ -1,0 +1,359 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.93.0
+
+jobs:
+  ui:
+    name: Build web UI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.1 --activate
+
+      - name: Install dependencies
+        working-directory: src/ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build UI
+        working-directory: src/ui
+        run: pnpm run build
+
+      - name: Upload UI
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-dist
+          path: src/ui/dist
+          retention-days: 1
+
+  rust:
+    name: Check and test Rust
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: smalog_test
+          POSTGRES_USER: smalog
+          POSTGRES_PASSWORD: smalog_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U smalog -d smalog_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SMALOG_TEST_POSTGRES_URL: postgres://smalog:smalog_test@127.0.0.1:5432/smalog_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" \
+            --profile minimal \
+            --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  build:
+    name: Build application
+    needs:
+      - ui
+      - rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Download UI
+        uses: actions/download-artifact@v8
+        with:
+          name: ui-dist
+          path: src/ui/dist
+
+      - name: Build UI-enabled binary
+        run: cargo build --release --locked --package smalog --features ui
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: smalog-linux-amd64
+          path: target/release/smalog
+          retention-days: 7
+
+  release-build:
+    name: Release ${{ matrix.release_arch }}
+    if: github.event_name == 'release'
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: i686-unknown-linux-gnu
+            release_arch: linux-x86
+          - target: x86_64-unknown-linux-gnu
+            release_arch: linux-amd64
+          - target: armv7-unknown-linux-gnueabihf
+            release_arch: linux-armv7
+          - target: aarch64-unknown-linux-gnu
+            release_arch: linux-arm64
+    steps:
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH syntax."
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Download UI
+        uses: actions/download-artifact@v8
+        with:
+          name: ui-dist
+          path: src/ui/dist
+
+      - name: Install cross
+        run: >-
+          cargo install cross
+          --git https://github.com/cross-rs/cross.git
+          --rev 1d07d3f9cc465c435256f1aabc1d18024517891a
+          --locked
+
+      - name: Build release binary
+        run: >-
+          cross build
+          --release
+          --locked
+          --target "${{ matrix.target }}"
+          --package smalog
+          --features ui
+
+      - name: Package release
+        env:
+          RELEASE_ARCH: ${{ matrix.release_arch }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          install -D -m 0755 "target/$TARGET/release/smalog" package/smalog
+          install -D -m 0644 config.example.toml package/config.example.toml
+          install -D -m 0644 packaging/smalog.service package/smalog.service
+          install -D -m 0644 README.md package/README.md
+          install -D -m 0644 LICENSE.md package/LICENSE.md
+          mkdir -p release
+          tar -C package -czf \
+            "release/smalog-${RELEASE_TAG}-${RELEASE_ARCH}.tar.gz" .
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.release_arch }}
+          path: release/*.tar.gz
+          retention-days: 1
+
+  release-image:
+    name: Publish multi-architecture image
+    if: github.event_name == 'release'
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: fgehann
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            docker.io/fgehann/smalog
+          tags: |
+            type=raw,value=${{ github.event.release.tag_name }}
+            type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/386,linux/amd64,linux/arm/v7,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=release-image
+          cache-to: type=gha,mode=max,scope=release-image
+
+  release:
+    name: Publish release assets
+    if: github.event_name == 'release'
+    needs:
+      - release-build
+      - release-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: release
+        run: sha256sum smalog-*.tar.gz > SHA256SUMS
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            release/smalog-*.tar.gz \
+            release/SHA256SUMS \
+            --clobber
+
+      - name: Update release description
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          gh api "repos/${GH_REPO}/releases/${RELEASE_ID}" \
+            --jq '.body // ""' > release/current-description.md
+          gh api "repos/${GH_REPO}/releases?per_page=100" \
+            > release/releases.json
+          previous_tag="$(
+            jq -r --argjson current_id "$RELEASE_ID" \
+              '[.[] | select(.id != $current_id and .draft == false)][0].tag_name // empty' \
+              release/releases.json
+          )"
+
+          notes_args=(--raw-field tag_name="$RELEASE_TAG")
+          if [[ -n "$previous_tag" ]]; then
+            notes_args+=(--raw-field previous_tag_name="$previous_tag")
+          fi
+          gh api --method POST "repos/${GH_REPO}/releases/generate-notes" \
+            "${notes_args[@]}" \
+            --jq '.body // ""' > release/generated-notes.md
+
+          if ! grep -q '[^[:space:]]' release/current-description.md; then
+            cp release/generated-notes.md release/release-notes.md
+          elif cmp -s \
+            release/current-description.md \
+            release/generated-notes.md; then
+            cp release/current-description.md release/release-notes.md
+          elif grep -Fq "## What's Changed" \
+            release/current-description.md; then
+            cp release/current-description.md release/release-notes.md
+          else
+            {
+              cat release/current-description.md
+              printf '\n\n'
+              cat release/generated-notes.md
+            } > release/release-notes.md
+          fi
+
+          if ! grep -Fq '<!-- smalog-container-image -->' \
+            release/release-notes.md; then
+            package_name="${GH_REPO#*/}"
+            package_url="https://github.com/${GH_REPO}/pkgs/container/${package_name}"
+            {
+              dockerhub_url="https://hub.docker.com/r/fgehann/smalog"
+              printf '\n\n## Docker images\n\n'
+              printf '<!-- smalog-container-image -->\n'
+              printf -- "- GHCR: [\`ghcr.io/%s:%s\`](%s)\n" \
+                "$GH_REPO" "$RELEASE_TAG" "$package_url"
+              printf -- "- Docker Hub: [\`fgehann/smalog:%s\`](%s)\n" \
+                "$RELEASE_TAG" "$dockerhub_url"
+              if [[ "$RELEASE_PRERELEASE" != "true" ]]; then
+                printf -- "- GHCR latest: [\`ghcr.io/%s:latest\`](%s)\n" \
+                  "$GH_REPO" "$package_url"
+                printf -- "- Docker Hub latest: [\`fgehann/smalog:latest\`](%s)\n" \
+                  "$dockerhub_url"
+              fi
+              printf -- "- Platforms: \`linux/386\`, \`linux/amd64\`, "
+              printf "\`linux/arm/v7\`, \`linux/arm64\`\n"
+            } >> release/release-notes.md
+          fi
+
+          jq -n --rawfile body release/release-notes.md \
+            '{body: $body}' > release/update-release.json
+          gh api --method PATCH \
+            "repos/${GH_REPO}/releases/${RELEASE_ID}" \
+            --input release/update-release.json

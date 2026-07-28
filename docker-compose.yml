@@ -1,0 +1,47 @@
+# Example smalog deployment.
+#
+# Fixed inverter IPs work with the default bridge network below.
+# Bluetooth and serial-only Ethernet multicast discovery require host
+# networking. In that case, uncomment network_mode and remove ports.
+# See docs/docker.md.
+
+services:
+  smalog:
+    build: .
+    # Or use a published multi-arch image:
+    # image: fgehann/smalog:latest
+    # GHCR mirror: ghcr.io/teian/smalog:latest
+    image: smalog:latest
+    container_name: smalog
+    restart: unless-stopped
+    # Required for Bluetooth or serial-only Ethernet discovery:
+    # network_mode: host
+    # Remove ports when enabling host networking.
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.toml:/etc/smalog/config.toml:ro
+      - smalog-data:/var/lib/smalog
+    environment:
+      # Secrets referenced as ${...} in config.toml. Prefer an .env file
+      # or your orchestrator's secret store over inline values.
+      SMALOG_INV1_PASSWORD: ${SMALOG_INV1_PASSWORD:-0000}
+      SMALOG_BT_PASSWORD: ${SMALOG_BT_PASSWORD:-0000}
+      # SMALOG_MQTT_PASSWORD: ${SMALOG_MQTT_PASSWORD}
+      # SMALOG_DB_PASSWORD: ${SMALOG_DB_PASSWORD}
+
+  # Optional PostgreSQL backend. Point database.url at it in config.toml:
+  #   url = "postgres://smalog:${SMALOG_DB_PASSWORD}@db:5432/smalog"
+  # db:
+  #   image: postgres:16-alpine
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: smalog
+  #     POSTGRES_PASSWORD: ${SMALOG_DB_PASSWORD}
+  #     POSTGRES_DB: smalog
+  #   volumes:
+  #     - smalog-pg:/var/lib/postgresql/data
+
+volumes:
+  smalog-data:
+  # smalog-pg:

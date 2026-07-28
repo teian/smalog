@@ -1,0 +1,155 @@
+# smalog — SMA inverter logger configuration (TOML).
+#
+# String values support ${ENV_VAR} expansion so secrets (inverter
+# passwords, MQTT credentials) can be injected from the environment
+# instead of being stored in this file. An unset variable is a hard
+# error at startup.
+#
+# Copy to /etc/smalog/config.toml and edit. Validate with:
+#   smalog --config config.toml check-config
+
+# Language for event texts and CSV headers (SBFspot Locale). One of
+# en-US, de-DE, es-ES, fr-FR, it-IT, nl-NL (or the bare code, e.g. "de").
+locale = "en-US"
+
+[service]
+# Poll interval in seconds. Ticks are aligned to the wall clock, so 300
+# fires at :00 :05 :10 … matching SBFspot's 5-minute archive slots.
+interval = 300
+# IANA timezone for day boundaries and archive timestamps.
+timezone = "Europe/Brussels"
+# HTTP endpoint for /healthz and /status. Comment out to disable.
+listen = "0.0.0.0:8080"
+# Poll around the clock instead of only between sunrise and sunset.
+poll_at_night = false
+# Derive missing Pdc/Pac from voltage x current (SBFspot CalcMissingSpot).
+calc_missing_spot = false
+# Poll household consumption from the inverter's consumer-power LRIs and
+# fill the Consumption table. Off by default and only useful with an SMA
+# consumption meter attached; inverters without one report "LRI not
+# available" (SBFspot never queries these at all).
+poll_consumption = false
+
+[plant]
+name = "MyPlant"
+# Decimal degrees. Used to gate polling to daylight hours. Set both to
+# 0.0 to disable the daylight gate entirely.
+latitude = 50.85
+longitude = 4.35
+# Seconds of slack added around sunrise/sunset (SBFspot SunRSOffset).
+sun_rs_offset = 900
+
+[log]
+# trace | debug | info | warn | error, or any tracing filter directive.
+level = "info"
+# text | json
+format = "text"
+
+[database]
+# SQLite (auto-created) …
+url = "sqlite:///var/lib/smalog/smalog.db"
+# … or PostgreSQL:
+# url = "postgres://smalog:${SMALOG_DB_PASSWORD}@db:5432/smalog"
+# Maintain the optional, rebuildable daily diagnostics cache.
+daily_statistics = false
+
+[archive]
+# Months of daily totals to (re)fetch each day.
+months = 1
+# Months of the device event log to fetch each day. 0 disables events.
+event_months = 1
+
+# One [[inverter]] block per inverter. Ethernet and Bluetooth entries can
+# be mixed in the same smalog instance.
+[[inverter]]
+name = "Roof east"
+communication = "ethernet"
+# Fixed IP (recommended, works in Docker bridge networking) …
+address = "192.168.1.50"
+password = "${SMALOG_INV1_PASSWORD}"
+# user | installer
+user_group = "user"
+
+# … or omit the address and locate the inverter by serial via multicast
+# discovery (needs host networking in Docker):
+# [[inverter]]
+# name = "Roof west"
+# communication = "ethernet"
+# serial = 1234567890
+# password = "${SMALOG_INV2_PASSWORD}"
+
+# Bluetooth inverter (Linux/BlueZ or Windows; needs host Bluetooth access
+# when containerized). The serial is discovered during the Bluetooth
+# handshake. See docs/bluetooth.md.
+# [[inverter]]
+# name = "Garage"
+# communication = "bluetooth"
+# address = "00:80:25:AA:BB:CC"
+# local_adapter = "AA:BB:CC:DD:EE:FF"   # optional: pick a specific adapter
+# password = "${SMALOG_BT_PASSWORD}"
+# user_group = "user"
+# mis_enabled = false
+# Automatic inverter clock-sync (SBFspot SetPlantTime), Bluetooth only —
+# Speedwire devices get their time from the network. 0 disables it;
+# 1 = daily, 7 = weekly, 30 = monthly. Only adjusts when the drift is
+# between synch_time_low and synch_time_high seconds. You can also run it
+# once manually: `smalog set-time` (or `set-time2` as a fallback).
+# synch_time = 0
+# synch_time_low = 60
+# synch_time_high = 3600
+
+# SBFspot-compatible CSV export. Off by default — the database is the
+# system of record. When enabled, each poll appends a spot row (and a
+# battery row for battery inverters) to a per-day file, and the daily
+# archive run rewrites the day/month/event files. See docs/csv.md.
+# Standard column layout only (the Webbox variant and 123Solar are not
+# implemented).
+[csv]
+enabled = false
+# Directory for spot/day/month CSVs; strftime specifiers are expanded
+# against the day being written (SBFspot OutputPath).
+output_path = "/var/lib/smalog/csv/%Y"
+# Directory for event CSVs (SBFspot OutputPathEvents).
+output_path_events = "/var/lib/smalog/csv/%Y/Events"
+# Write the SMA 8-line "Version CSV1" preamble (SBFspot CSV_ExtendedHeader).
+extended_header = true
+# Write the column-name header row (SBFspot CSV_Header).
+header = true
+# Pad the day file with zero-power rows for 00:00–23:55 (CSV_SaveZeroPower).
+save_zero_power = false
+# Field separator and decimal separator; they must differ.
+delimiter = ";"
+decimal_point = "."
+# strftime patterns for the timestamp / month-date columns.
+datetime_format = "%d/%m/%Y %H:%M:%S"
+date_format = "%d/%m/%Y"
+# inverter | computer — which clock stamps spot rows (CSV_Spot_TimeSource).
+spot_time_source = "inverter"
+# Decimal places for numeric fields (SBFspot hard-codes 3).
+precision = 3
+
+[mqtt]
+enabled = false
+host = "localhost"
+port = 1883
+# Base topic for the structured tree; {plantname} and {serial} are
+# expanded. Every reading publishes as a grouped scalar leaf topic beneath
+# it (e.g. smalog/<serial>/ac/power_total). See docs/mqtt.md.
+base_topic = "smalog/{serial}"
+# Publish Home Assistant MQTT-Discovery configs so HA auto-creates every
+# entity (and nests each string under the inverter).
+homeassistant = false
+# discovery_prefix = "homeassistant"
+# client_id = "smalog"
+# username = "mqttuser"
+# password = "${SMALOG_MQTT_PASSWORD}"
+qos = 0
+# Retain leaf state topics so late subscribers / HA restarts see the last
+# values immediately (recommended). Availability and discovery are always
+# retained regardless.
+retain = true
+
+# Note: ${ENV_VAR} references are expanded for every value in the file,
+# regardless of section. Keep secret lines (e.g. the commented MQTT and
+# Bluetooth passwords above) commented until you use them, so the file
+# loads without those variables set.

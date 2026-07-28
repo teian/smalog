@@ -1,0 +1,79 @@
+# Domain Context
+
+This glossary defines the domain language used by smalog's architecture and
+implementation.
+
+## Poll Cycle
+
+A **Poll Cycle** is one scheduled attempt to collect current inverter data,
+persist it, update runtime status, and invoke configured exports. A Poll Cycle
+may contain independent results for multiple configured collectors and
+inverters.
+
+## Inverter Fleet
+
+An **Inverter Fleet** is the deep connection module that owns configured
+inverter communication. Its external interface exposes exactly three
+operations:
+
+- `poll` performs one complete hardware-side Poll Cycle;
+- `probe` performs read-only connectivity or data diagnostics;
+- `set_clock` performs an explicitly requested clock operation.
+
+Each operation owns connection establishment, device resolution, login,
+protocol work, per-inverter outcome attribution, and best-effort cleanup.
+Callers cannot control or reorder those lifecycle steps.
+
+The Inverter Fleet interface is protocol-neutral. Speedwire and Bluetooth
+share an internal SMA Data 2 Plus implementation using their native transport
+adapters. SMA Data V1 has a separate internal implementation for RS232, RS485,
+and Powerline. Ethernet datagrams, Bluetooth frames, SMA commands, fragments,
+and protocol sentinels do not cross the external Inverter Fleet seam.
+
+## Daily Archive
+
+A **Daily Archive** is the month, event, and related historical data fetched
+once per local calendar day for a configured collector or inverter.
+
+## Daily Archive Area
+
+A **Daily Archive Area** is one independently retried part of a Daily Archive:
+
+- the monthly and yield archive;
+- the event archive, when event collection is enabled.
+
+## Daily Archive Completion
+
+**Daily Archive Completion** is tracked independently for each inverter. It
+means that the required Daily Archive data for that inverter has been
+successfully persisted to the database. CSV and MQTT results do not determine
+or block Daily Archive Completion.
+
+Completion is tracked separately for every enabled Daily Archive Area. An
+inverter reaches Daily Archive Completion only after all of its enabled areas
+are complete.
+
+Failed required database persistence leaves the affected area incomplete and
+must be retried on a later Poll Cycle. It does not reset another completed area
+or block Daily Archive Completion for another inverter.
+
+The completion state is durable database state keyed by local calendar date,
+inverter, and Daily Archive Area. The area completion marker and its archive
+data are persisted in the same database transaction. Process-local state such
+as a single `last_daily` date is not authoritative.
+
+A successful archive request with a valid empty result completes its area.
+Event collection completes when the requested period has been processed or the
+end of the event log has been reached.
+
+An explicitly unsupported archive capability is persisted as `unsupported`
+and is terminally complete for that inverter and area. A timeout, connection
+failure, incomplete fragment sequence, decode failure, or database failure
+leaves the area incomplete and requires a retry. Failed attempts and their
+latest error are persisted for observability without changing completion.
+
+## Best-effort Export
+
+A **Best-effort Export** is an external output such as CSV or MQTT. Its failure
+must be observable, but it does not roll back database persistence and does not
+block Daily Archive Completion.

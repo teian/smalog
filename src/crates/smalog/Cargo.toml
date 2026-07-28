@@ -14,13 +14,15 @@ ui = ["dep:rust-embed"]
 
 [dependencies]
 smalog-connection = { path = "../smalog-connection" }
+smalog-export = { path = "../smalog-export" }
+smalog-observation = { path = "../smalog-observation" }
 smalog-sbfspot-migrator = { path = "../smalog-sbfspot-migrator" }
 smalog-storage = { path = "../smalog-storage" }
+smalog-tags = { path = "../smalog-tags" }
 axum = "0.8.1"
 chrono = "0.4.45"
 chrono-tz = "0.10.4"
 clap = { version = "4.6.1", features = ["derive"] }
-rumqttc = "0.25.1"
 rust-embed = { version = "8.5.0", features = ["mime-guess"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

@@ -2,7 +2,9 @@
 
 smalog can write the same CSV files as SBFspot, for tools and spreadsheets
 that read them. It is **off by default** — the database is the primary
-store — and enabled with a `[csv]` section:
+store — and enabled with a `[csv]` section. The implementation and its
+configuration live in the standalone
+[`smalog-export`](../src/crates/smalog-export/) crate:
 
 ```toml
 [csv]
@@ -53,7 +55,8 @@ created as needed.
 
 The **standard** column layout is implemented for compatibility (spot, day,
 month, battery and event files, including MPPT column padding for
-multi-inverter alignment). Two SBFspot CSV features are **not implemented**:
+multi-inverter alignment). Two SBFspot CSV features are **planned but not
+implemented**:
 
 - the **Webbox header** variant (`CSV_Spot_WebboxHeader`) — a wide
   one-row-per-timestamp layout;
@@ -62,3 +65,5 @@ multi-inverter alignment). Two SBFspot CSV features are **not implemented**:
 One deliberate deviation: SBFspot gives `Spot.csv` battery-style headers
 when the plant contains any battery device (a latent bug). smalog gives
 spot files spot headers and battery files battery headers.
+The export crate's capability catalog records both planned targets
+explicitly.

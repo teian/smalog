@@ -1,0 +1,8 @@
+[package]
+name = "smalog-observation"
+version = "0.1.0"
+edition = "2021"
+description = "Canonical protocol-neutral observations for smalog"
+license = "EUPL-1.2"
+repository = "https://github.com/teian/smalog"
+rust-version = "1.85"

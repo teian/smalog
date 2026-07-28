@@ -75,7 +75,11 @@ multi-crate ceremony.
 
 > **How smalog applies this.** smalog is a workspace with `resolver = "2"`:
 > the reusable [`smalog-connection`](../src/crates/smalog-connection/)
-> library (no I/O in its shared decoder layer) and the
+> library (no I/O in its shared decoder layer),
+> [`smalog-observation`](../src/crates/smalog-observation/) for the canonical
+> protocol-neutral Poll Cycle contract,
+> [`smalog-storage`](../src/crates/smalog-storage/) for persistence,
+> [`smalog-export`](../src/crates/smalog-export/) for external output, and the
 > [`smalog`](../src/crates/smalog/) binary that wraps it. Two intentional
 > deviations from the template above: crates live
 > under `src/crates/<name>` (not `crates/`), and the license is

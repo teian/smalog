@@ -7,7 +7,7 @@
 //! retained MQTT-Discovery configs so Home Assistant creates every entity
 //! (and nests each string under the inverter) automatically.
 //!
-//! Every reading comes from the [`crate::metrics`] registry — see
+//! Every reading comes from the crate's metric registry — see
 //! `docs/mqtt.md`.
 
 use std::collections::{BTreeSet, HashMap};
@@ -19,10 +19,10 @@ use serde_json::{json, Map, Value as Json};
 use tracing::{debug, warn};
 
 use crate::config::MqttConfig;
-use crate::daylight::SunTimes;
 use crate::error::{Error, Result};
 use crate::metrics::{self, Context, Metric, Owner};
-use smalog_connection::smadata2::inverter::InverterData;
+use crate::view::{from_cycle, ExportInverter};
+use smalog_observation::PollCycleObservation;
 
 /// Per-inverter state remembered across poll cycles: which AC phases and
 /// MPP trackers have ever reported data (the published set only grows, so
@@ -48,12 +48,21 @@ pub struct Publisher {
     plant_name: String,
     tz: Tz,
     bridge_topic: String,
+    version: String,
     state: Mutex<HashMap<u32, SerialState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SunTimes {
+    /// Local decimal hours.
+    pub sunrise: f64,
+    /// Local decimal hours.
+    pub sunset: f64,
 }
 
 impl Publisher {
     /// Create the client and spawn its event loop.
-    pub fn start(cfg: &MqttConfig, plant_name: &str, tz: Tz) -> Result<Publisher> {
+    pub fn start(cfg: &MqttConfig, plant_name: &str, tz: Tz, version: &str) -> Result<Publisher> {
         let client_id = cfg
             .client_id
             .clone()
@@ -93,6 +102,7 @@ impl Publisher {
             plant_name: plant_name.to_string(),
             tz,
             bridge_topic,
+            version: version.to_string(),
             state: Mutex::new(HashMap::new()),
         })
     }
@@ -107,19 +117,24 @@ impl Publisher {
 
     /// Publish the structured tree (and, if enabled, discovery) for every
     /// inverter.
-    pub async fn publish(&self, inverters: &[InverterData], sun: Option<SunTimes>) -> Result<()> {
+    pub async fn publish(&self, cycle: &PollCycleObservation, sun: Option<SunTimes>) -> Result<()> {
+        let inverters = from_cycle(cycle);
         let msgs = {
             // Synchronous assembly: the state lock is never held across an
             // await.
             let mut state = self.state.lock().unwrap();
+            let context = Context {
+                plant_name: &self.plant_name,
+                tz: self.tz,
+                sun,
+                version: &self.version,
+            };
             build_messages(
                 &self.cfg,
-                &self.plant_name,
-                self.tz,
+                &context,
                 &self.bridge_topic,
                 &mut state,
-                inverters,
-                sun,
+                &inverters,
             )
         };
         for m in msgs {
@@ -138,26 +153,17 @@ impl Publisher {
 /// phase/tracker sets across cycles.
 fn build_messages(
     cfg: &MqttConfig,
-    plant_name: &str,
-    tz: Tz,
+    ctx: &Context<'_>,
     bridge_topic: &str,
     state: &mut HashMap<u32, SerialState>,
-    inverters: &[InverterData],
-    sun: Option<SunTimes>,
+    inverters: &[ExportInverter],
 ) -> Vec<Msg> {
-    let ctx = Context {
-        plant_name,
-        tz,
-        sun,
-        version: crate::VERSION,
-    };
-
     let mut msgs: Vec<Msg> = Vec::new();
 
     for inv in inverters {
         let base = cfg
             .base_topic
-            .replace("{plantname}", plant_name)
+            .replace("{plantname}", ctx.plant_name)
             .replace("{serial}", &inv.serial.to_string());
         let avail_topic = format!("{base}/availability");
 
@@ -179,7 +185,7 @@ fn build_messages(
 
         // The full registry is always published; discovery (when enabled)
         // and the `attributes` document describe exactly this set.
-        let all = metrics::build(inv, &ctx, &phases, &trackers);
+        let all = metrics::build_view(inv, ctx, &phases, &trackers);
 
         // Discovery, re-emitted only when the published set grows.
         if cfg.homeassistant {
@@ -189,7 +195,7 @@ fn build_messages(
                 for m in &all {
                     msgs.push(discovery_msg(
                         cfg,
-                        plant_name,
+                        ctx.plant_name,
                         bridge_topic,
                         inv,
                         &base,
@@ -216,7 +222,7 @@ fn build_messages(
         for m in &all {
             msgs.push(Msg {
                 topic: format!("{base}/{}", m.path),
-                payload: m.value.to_payload(tz),
+                payload: m.value.to_payload(ctx.tz),
                 retain: cfg.retain,
             });
         }
@@ -230,7 +236,7 @@ fn discovery_msg(
     cfg: &MqttConfig,
     plant_name: &str,
     bridge_topic: &str,
-    inv: &InverterData,
+    inv: &ExportInverter,
     base: &str,
     avail_topic: &str,
     m: &Metric,
@@ -270,7 +276,7 @@ fn discovery_msg(
 
 /// The HA `device` block: the inverter, or a string child linked to it via
 /// `via_device`.
-fn device_block(plant_name: &str, inv: &InverterData, owner: Owner) -> Json {
+fn device_block(plant_name: &str, inv: &ExportInverter, owner: Owner) -> Json {
     let inv_id = format!("smalog_{}", inv.serial);
     let inv_name = if inv.display_name().is_empty() {
         plant_name.to_string()
@@ -328,32 +334,35 @@ fn root_prefix(base_topic: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smalog_connection::smadata2::inverter::Mppt;
+    use crate::view::Mppt;
 
-    fn inv() -> InverterData {
-        let mut i = InverterData::new("10.0.0.5".into());
-        i.serial = 42;
-        i.device_name = "SB5000TL".into();
-        i.device_type = "SB5000TL-21".into();
-        i.total_pac = 4200;
-        i.uac1 = 23012;
-        i.mpp.insert(
-            1,
-            Mppt {
-                pdc: 800,
-                udc: 38000,
-                idc: 2100,
-            },
-        );
-        i.mpp.insert(
-            2,
-            Mppt {
-                pdc: 700,
-                udc: 37000,
-                idc: 1900,
-            },
-        );
-        i
+    fn inv() -> ExportInverter {
+        ExportInverter {
+            serial: 42,
+            device_name: "SB5000TL".into(),
+            device_type: "SB5000TL-21".into(),
+            total_pac: 4200,
+            uac1: 23012,
+            mpp: std::collections::BTreeMap::from([
+                (
+                    1,
+                    Mppt {
+                        pdc: 800,
+                        udc: 38000,
+                        idc: 2100,
+                    },
+                ),
+                (
+                    2,
+                    Mppt {
+                        pdc: 700,
+                        udc: 37000,
+                        idc: 1900,
+                    },
+                ),
+            ]),
+            ..ExportInverter::default()
+        }
     }
 
     fn cfg(homeassistant: bool) -> MqttConfig {
@@ -363,10 +372,19 @@ mod tests {
         }
     }
 
+    fn context(plant_name: &str) -> Context<'_> {
+        Context {
+            plant_name,
+            tz: Tz::UTC,
+            sun: None,
+            version: "test",
+        }
+    }
+
     fn run(cfg: &MqttConfig) -> (Vec<Msg>, HashMap<u32, SerialState>) {
         let bridge = format!("{}/bridge/availability", root_prefix(&cfg.base_topic));
         let mut state = HashMap::new();
-        let msgs = build_messages(cfg, "MyPlant", Tz::UTC, &bridge, &mut state, &[inv()], None);
+        let msgs = build_messages(cfg, &context("MyPlant"), &bridge, &mut state, &[inv()]);
         (msgs, state)
     }
 
@@ -439,27 +457,11 @@ mod tests {
         let bridge = "smalog/bridge/availability".to_string();
         let mut state = HashMap::new();
 
-        let first = build_messages(
-            &cfg,
-            "MyPlant",
-            Tz::UTC,
-            &bridge,
-            &mut state,
-            &[inv()],
-            None,
-        );
+        let first = build_messages(&cfg, &context("MyPlant"), &bridge, &mut state, &[inv()]);
         assert!(first.iter().any(|m| m.topic.contains("/config")));
 
         // Same shape next cycle -> no discovery re-emitted.
-        let second = build_messages(
-            &cfg,
-            "MyPlant",
-            Tz::UTC,
-            &bridge,
-            &mut state,
-            &[inv()],
-            None,
-        );
+        let second = build_messages(&cfg, &context("MyPlant"), &bridge, &mut state, &[inv()]);
         assert!(!second.iter().any(|m| m.topic.contains("/config")));
 
         // A third string appears -> discovery grows again.
@@ -472,15 +474,7 @@ mod tests {
                 idc: 1500,
             },
         );
-        let third = build_messages(
-            &cfg,
-            "MyPlant",
-            Tz::UTC,
-            &bridge,
-            &mut state,
-            &[bigger],
-            None,
-        );
+        let third = build_messages(&cfg, &context("MyPlant"), &bridge, &mut state, &[bigger]);
         assert!(third
             .iter()
             .any(|m| m.topic == "homeassistant/sensor/smalog_42_mppt_3_power/config"));
@@ -493,13 +487,13 @@ mod tests {
         let mut state = HashMap::new();
 
         // Single-phase sample: no L2 voltage ever seen.
-        let one = build_messages(&cfg, "P", Tz::UTC, &bridge, &mut state, &[inv()], None);
+        let one = build_messages(&cfg, &context("P"), &bridge, &mut state, &[inv()]);
         assert!(!topics(&one).contains(&"smalog/42/ac/voltage_l2"));
 
         // Once L2 reports, it sticks.
         let mut three = inv();
         three.uac2 = 23000;
-        let two = build_messages(&cfg, "P", Tz::UTC, &bridge, &mut state, &[three], None);
+        let two = build_messages(&cfg, &context("P"), &bridge, &mut state, &[three]);
         assert!(topics(&two).contains(&"smalog/42/ac/voltage_l2"));
     }
 
@@ -560,7 +554,7 @@ mod tests {
             inverter.mpp.clear();
             inverter.mpp.extend(trackers.iter().copied());
             let mut state = HashMap::new();
-            let msgs = build_messages(&cfg, "P", Tz::UTC, &bridge, &mut state, &[inverter], None);
+            let msgs = build_messages(&cfg, &context("P"), &bridge, &mut state, &[inverter]);
             let actual: Vec<u8> = state[&42].seen_trackers.iter().copied().collect();
             assert_eq!(&actual, expected);
             for &tracker in *expected {
@@ -580,12 +574,10 @@ mod tests {
         let mut state = HashMap::new();
         let msgs = build_messages(
             &cfg,
-            "Anlage München",
-            Tz::UTC,
+            &context("Anlage München"),
             &bridge,
             &mut state,
             &[inverter],
-            None,
         );
 
         let name = msgs

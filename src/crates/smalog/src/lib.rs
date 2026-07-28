@@ -9,13 +9,9 @@
 //! Licensed under the EUPL-1.2.
 
 pub mod config;
-pub mod csv;
 pub mod daylight;
 pub mod error;
-pub mod metrics;
-pub mod mqttpub;
 pub mod service;
-pub mod storage_adapter;
 
 /// Compatibility re-export of the canonical storage domain.
 pub mod domain {

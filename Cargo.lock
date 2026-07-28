@@ -1881,13 +1881,15 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
- "rumqttc",
  "rust-embed",
  "serde",
  "serde_json",
  "smalog-connection",
+ "smalog-export",
+ "smalog-observation",
  "smalog-sbfspot-migrator",
  "smalog-storage",
+ "smalog-tags",
  "sqlx",
  "tempfile",
  "thiserror",
@@ -1909,12 +1911,35 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "serde_json",
+ "smalog-observation",
+ "smalog-tags",
  "socket2",
  "thiserror",
  "tokio",
  "tracing",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "smalog-export"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "rumqttc",
+ "serde",
+ "serde_json",
+ "smalog-observation",
+ "smalog-tags",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "smalog-observation"
+version = "0.1.0"
 
 [[package]]
 name = "smalog-sbfspot-migrator"
@@ -1954,11 +1979,20 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "smalog-observation",
  "sqlx",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "smalog-tags"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

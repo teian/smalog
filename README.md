@@ -48,8 +48,13 @@ SMA Data V1 transports. Speedwire and Bluetooth are operational; RS485 currently
 exposes the stable SMA-Net interface, while RS232 and Powerline expose their
 respective SMA Data V1 boundaries. These three legacy transports report that
 their I/O is not yet implemented.
-[`smalog-storage`](src/crates/smalog-storage/) owns the canonical schema and
-persistence; the
+[`smalog-observation`](src/crates/smalog-observation/) defines the strongly
+typed, protocol-neutral Poll Cycle exchanged by connection, persistence,
+status and exporters. [`smalog-storage`](src/crates/smalog-storage/) owns the
+canonical schema and persistence; [`smalog-export`](src/crates/smalog-export/)
+owns CSV, MQTT and
+the explicit catalog of planned export adapters; the
+localized SMA catalog lives in [`smalog-tags`](src/crates/smalog-tags/); the
 [`SBFspot migrator`](src/crates/smalog-sbfspot-migrator/) and
 [`schema benchmark`](src/crates/smalog-schema-benchmark/) are standalone
 tools. The [`smalog` app](src/crates/smalog/) composes these modules into the

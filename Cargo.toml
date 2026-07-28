@@ -1,10 +1,13 @@
 [workspace]
 members = [
     "src/crates/smalog",
+    "src/crates/smalog-export",
     "src/crates/smalog-sbfspot-migrator",
     "src/crates/smalog-schema-benchmark",
     "src/crates/smalog-storage",
     "src/crates/smalog-connection",
+    "src/crates/smalog-observation",
+    "src/crates/smalog-tags",
 ]
 resolver = "2"
 

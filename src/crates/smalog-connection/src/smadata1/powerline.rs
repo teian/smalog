@@ -37,6 +37,18 @@ impl PowerlineConnection {
 
 #[async_trait::async_trait]
 impl Connection for PowerlineConnection {
+    fn communication(
+        &self,
+    ) -> (
+        smalog_observation::ProtocolFamily,
+        smalog_observation::Transport,
+    ) {
+        (
+            smalog_observation::ProtocolFamily::SmaData1,
+            smalog_observation::Transport::Powerline,
+        )
+    }
+
     fn devices(&self) -> Vec<DeviceId> {
         Vec::new()
     }

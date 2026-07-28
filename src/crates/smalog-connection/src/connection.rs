@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::smadata2::commands::SMA_ERR_LRI_NOT_AVAILABLE;
+use smalog_observation::{ProtocolFamily, Transport};
 
 /// SMA login group — user or installer (affects the login code and which
 /// event log is readable).
@@ -85,6 +86,9 @@ pub enum SyncOutcome {
 /// `begin` → `login_all` → (`set_clock`) → many `request_all` → `end`.
 #[async_trait::async_trait]
 pub trait Connection: Send {
+    /// Protocol family and physical transport implemented by this connection.
+    fn communication(&self) -> (ProtocolFamily, Transport);
+
     /// The inverters this connector talks to, known after [`Self::begin`].
     fn devices(&self) -> Vec<DeviceId>;
 

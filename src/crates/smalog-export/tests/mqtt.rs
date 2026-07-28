@@ -3,33 +3,36 @@
 //! rendering used by the structured / Home Assistant layouts.
 
 use chrono_tz::Tz;
-use smalog::connection::smadata2::inverter::{InverterData, Mppt};
-use smalog::metrics::{self, Context, Owner, Value};
+use smalog_export::metrics::{self, Context, Owner, Value};
+use smalog_observation::{
+    BatteryDiagnostics, CanonicalText, InverterPollObservation, MilliVolts, Milliamperes,
+    MpptMeasurement, Permille, WattHours, Watts,
+};
 
-fn sample() -> InverterData {
-    let mut inv = InverterData::new("10.0.0.5".into());
-    inv.serial = 1234567890;
-    inv.device_name = "SB5000TL".into();
-    inv.total_pac = 4200;
-    inv.e_today = 12_345;
-    inv.e_total = 9_876_543;
-    inv.uac1 = 23012;
-    inv.mpp.insert(
-        1,
-        Mppt {
-            pdc: 800,
-            udc: 38000,
-            idc: 2100,
+mod support;
+use support::{inverter, live};
+
+fn sample() -> InverterPollObservation {
+    let mut inv = inverter(1_234_567_890, "SB5000TL", "", 0);
+    let live = live(&mut inv);
+    live.reported_ac_power = Some(Watts::new(4_200));
+    live.measurement.energy_today = Some(WattHours::new(12_345));
+    live.measurement.energy_total = Some(WattHours::new(9_876_543));
+    live.measurement.ac_voltage[0] = Some(MilliVolts::new(230_120));
+    live.measurement.mppts = vec![
+        MpptMeasurement {
+            tracker_number: 1,
+            dc_power: Some(Watts::new(800)),
+            dc_voltage: Some(MilliVolts::new(380_000)),
+            dc_current: Some(Milliamperes::new(2_100)),
         },
-    );
-    inv.mpp.insert(
-        2,
-        Mppt {
-            pdc: 700,
-            udc: 37000,
-            idc: 1900,
+        MpptMeasurement {
+            tracker_number: 2,
+            dc_power: Some(Watts::new(700)),
+            dc_voltage: Some(MilliVolts::new(370_000)),
+            dc_current: Some(Milliamperes::new(1_900)),
         },
-    );
+    ];
     inv
 }
 
@@ -55,12 +58,6 @@ fn payload(m: &metrics::Metric) -> String {
 #[test]
 fn paths_and_scaling() {
     let inv = sample();
-    let canonical = smalog::storage_adapter::measurement(&inv, 1_700_000_000).unwrap();
-    assert_eq!(
-        canonical.mppts[0].dc_voltage.unwrap().get(),
-        380_000,
-        "protocol centivolts convert explicitly to canonical millivolts"
-    );
     let ms = metrics::build(&inv, &ctx(), &[1], &[1, 2]);
 
     assert_eq!(payload(find(&ms, "ac/power_total")), "4200.000");
@@ -73,58 +70,49 @@ fn paths_and_scaling() {
 
 #[test]
 fn empty_one_sparse_and_tracker_255_expand_without_contiguous_assumptions() {
-    type TrackerCase<'a> = (&'a [(u8, Mppt)], &'a [u8]);
+    type TrackerCase<'a> = (&'a [MpptMeasurement], &'a [u8]);
     let cases: &[TrackerCase<'_>] = &[
         (&[], &[]),
         (
-            &[(
-                7,
-                Mppt {
-                    pdc: 0,
-                    udc: 0,
-                    idc: 0,
-                },
-            )],
+            &[MpptMeasurement {
+                tracker_number: 7,
+                dc_power: Some(Watts::new(0)),
+                dc_voltage: Some(MilliVolts::new(0)),
+                dc_current: Some(Milliamperes::new(0)),
+            }],
             &[7],
         ),
         (
             &[
-                (
-                    2,
-                    Mppt {
-                        pdc: 202,
-                        udc: 20_002,
-                        idc: 2_002,
-                    },
-                ),
-                (
-                    255,
-                    Mppt {
-                        pdc: 255,
-                        udc: 25_500,
-                        idc: 2_550,
-                    },
-                ),
+                MpptMeasurement {
+                    tracker_number: 2,
+                    dc_power: Some(Watts::new(202)),
+                    dc_voltage: Some(MilliVolts::new(200_020)),
+                    dc_current: Some(Milliamperes::new(2_002)),
+                },
+                MpptMeasurement {
+                    tracker_number: 255,
+                    dc_power: Some(Watts::new(255)),
+                    dc_voltage: Some(MilliVolts::new(255_000)),
+                    dc_current: Some(Milliamperes::new(2_550)),
+                },
             ],
             &[2, 255],
         ),
         (
-            &[(
-                255,
-                Mppt {
-                    pdc: 255,
-                    udc: 25_500,
-                    idc: 2_550,
-                },
-            )],
+            &[MpptMeasurement {
+                tracker_number: 255,
+                dc_power: Some(Watts::new(255)),
+                dc_voltage: Some(MilliVolts::new(255_000)),
+                dc_current: Some(Milliamperes::new(2_550)),
+            }],
             &[255],
         ),
     ];
 
     for (trackers, expected) in cases {
         let mut inv = sample();
-        inv.mpp.clear();
-        inv.mpp.extend(trackers.iter().copied());
+        live(&mut inv).measurement.mppts = trackers.to_vec();
         let ms = metrics::build(&inv, &ctx(), &[1], expected);
         let actual: Vec<u8> = ms
             .iter()
@@ -145,8 +133,8 @@ fn empty_one_sparse_and_tracker_255_expand_without_contiguous_assumptions() {
 #[test]
 fn mqtt_identity_text_payloads_are_valid_utf8() {
     let mut inv = sample();
-    inv.configured_name = Some("Grüße aus 東京 🌞".into());
-    inv.device_type = "Wechselrichter Δ".into();
+    inv.identity.configured_name = Some(CanonicalText::new("Grüße aus 東京 🌞").unwrap());
+    inv.identity.model = Some(CanonicalText::new("Wechselrichter Δ").unwrap());
     let context = Context {
         plant_name: "Anlage München",
         ..ctx()
@@ -194,7 +182,7 @@ fn ha_classes_present_for_energy_dashboard() {
 #[test]
 fn timestamps_are_iso8601() {
     let mut inv = sample();
-    inv.inverter_datetime = 1_752_501_900; // 2025-07-14T14:05:00Z
+    live(&mut inv).inverter_time = Some(smalog_observation::UnixSeconds::new(1_752_501_900));
     let ms = metrics::build(&inv, &ctx(), &[1], &[1]);
     let t = find(&ms, "info/inv_time");
     assert!(matches!(t.value, Value::Time(_)));
@@ -208,8 +196,15 @@ fn battery_only_for_battery_devices() {
     assert!(metrics::build(&inv, &ctx(), &[1], &[1])
         .iter()
         .all(|m| !m.path.starts_with("battery/")));
-    inv.has_battery = true;
-    inv.bat_cha_stt = 87;
+    live(&mut inv).battery_diagnostics = Some(BatteryDiagnostics {
+        cycle_count: 0,
+        charged: smalog_observation::AmpereHours::new(0),
+        discharged: smalog_observation::AmpereHours::new(0),
+        temperature: None,
+        voltage: None,
+        current: None,
+        state_of_charge: Some(Permille::new(870)),
+    });
     let ms = metrics::build(&inv, &ctx(), &[1], &[1]);
     assert_eq!(payload(find(&ms, "battery/soc")), "87.000");
 }

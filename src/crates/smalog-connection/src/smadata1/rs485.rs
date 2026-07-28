@@ -44,6 +44,18 @@ impl Rs485Connection {
 
 #[async_trait::async_trait]
 impl Connection for Rs485Connection {
+    fn communication(
+        &self,
+    ) -> (
+        smalog_observation::ProtocolFamily,
+        smalog_observation::Transport,
+    ) {
+        (
+            smalog_observation::ProtocolFamily::SmaData1,
+            smalog_observation::Transport::Rs485,
+        )
+    }
+
     fn devices(&self) -> Vec<DeviceId> {
         Vec::new()
     }

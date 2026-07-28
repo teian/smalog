@@ -487,4 +487,4 @@ session runs off the async executor via `block_in_place`.
 | Record decoding | [`smadata2/decode.rs`](../src/crates/smalog-connection/src/smadata2/decode.rs) |
 | Day, month and event archives | [`smadata2/archive.rs`](../src/crates/smalog-connection/src/smadata2/archive.rs) |
 | Per-inverter state | [`smadata2/inverter.rs`](../src/crates/smalog-connection/src/smadata2/inverter.rs) |
-| Tag, status and event text | [`smadata2/tags.rs`](../src/crates/smalog-connection/src/smadata2/tags.rs) |
+| Tag, status and event text | [`smalog-tags`](../src/crates/smalog-tags/) (`smadata2::tags` remains a compatibility re-export) |

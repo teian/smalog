@@ -777,6 +777,18 @@ pub fn enumerate(params: &BluetoothParams) -> Result<Vec<DeviceId>> {
 
 #[async_trait::async_trait]
 impl<S: BtSocket> Connection for BluetoothConnection<S> {
+    fn communication(
+        &self,
+    ) -> (
+        smalog_observation::ProtocolFamily,
+        smalog_observation::Transport,
+    ) {
+        (
+            smalog_observation::ProtocolFamily::SmaData2Plus,
+            smalog_observation::Transport::Bluetooth,
+        )
+    }
+
     fn devices(&self) -> Vec<DeviceId> {
         self.devices.iter().map(device_id).collect()
     }

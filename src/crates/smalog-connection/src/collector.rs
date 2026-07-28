@@ -22,6 +22,7 @@ use crate::smadata2::commands::{QueryKind, CMD_ARCHIVE_DAY, CMD_ARCHIVE_MONTH};
 use crate::smadata2::decode::decode_spot_records;
 use crate::smadata2::inverter::InverterData;
 use crate::speedwire::packet::Datagram;
+use smalog_observation::PollCycleObservation;
 
 /// Poll behaviour toggles (SBFspot CalcMissingSpot / consumption).
 #[derive(Debug, Clone, Copy, Default)]
@@ -83,6 +84,40 @@ impl Collector {
 
         res?;
         Ok(self.inverters.clone())
+    }
+
+    /// One complete Poll Cycle converted at the connection seam into
+    /// protocol-neutral canonical observations.
+    pub async fn cycle_observations(
+        &mut self,
+        fetch_day: bool,
+        daily: Option<(u32, u32)>,
+    ) -> Result<PollCycleObservation> {
+        let observed_at = Utc::now().timestamp();
+        self.cycle(fetch_day, daily).await?;
+        let (protocol, transport) = self.connector.communication();
+        Ok(crate::observation::poll_cycle(
+            &self.inverters,
+            observed_at,
+            protocol,
+            transport,
+            fetch_day,
+            daily,
+        )?)
+    }
+
+    /// Last successfully decoded state as protocol-neutral observations.
+    pub fn observations(&self) -> Result<PollCycleObservation> {
+        let observed_at = Utc::now().timestamp();
+        let (protocol, transport) = self.connector.communication();
+        Ok(crate::observation::poll_cycle(
+            &self.inverters,
+            observed_at,
+            protocol,
+            transport,
+            false,
+            None,
+        )?)
     }
 
     /// Non-mutating connection probe: begin session, log in, fetch a
@@ -465,6 +500,18 @@ mod tests {
 
     #[async_trait]
     impl Connection for FlakyLoginConnector {
+        fn communication(
+            &self,
+        ) -> (
+            smalog_observation::ProtocolFamily,
+            smalog_observation::Transport,
+        ) {
+            (
+                smalog_observation::ProtocolFamily::SmaData2Plus,
+                smalog_observation::Transport::Ethernet,
+            )
+        }
+
         fn devices(&self) -> Vec<DeviceId> {
             vec![DeviceId {
                 susy_id: 123,

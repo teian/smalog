@@ -23,15 +23,17 @@ use tracing::{error, info, warn};
 use crate::config::{Config, InverterCommunication, InverterConfig};
 use crate::daylight;
 use crate::error::Result;
-use crate::mqttpub::Publisher;
 use crate::storage::Db;
-use crate::storage_adapter;
-use smalog_connection::smadata2::inverter::{EventData, InverterData};
-use smalog_connection::smadata2::tags;
 use smalog_connection::{
     BluetoothConnection, Collector, Connection, PollOptions, SpeedwireConnection,
     SpeedwireInverterSpec,
 };
+use smalog_export::{CsvWriter, MqttPublisher, SunTimes as ExportSunTimes};
+use smalog_observation::{
+    ArchiveOutcome, CanonicalText, EventValue, InverterDailyYield, InverterEnergySample,
+    InverterEvent, InverterPollObservation, PollCycleObservation, UnixSeconds, WattHours, Watts,
+};
+use smalog_tags as tags;
 
 #[derive(Default)]
 struct Status {
@@ -55,7 +57,7 @@ pub struct Service {
     tz: Tz,
     collectors: Vec<ConfiguredCollector>,
     db: Arc<Db>,
-    mqtt: Option<Publisher>,
+    mqtt: Option<MqttPublisher>,
     status: Arc<RwLock<Status>>,
     last_daily: Option<chrono::NaiveDate>,
 }
@@ -81,7 +83,12 @@ impl Service {
         });
         let collectors = Self::build_collectors(&config, tz).await?;
         let mqtt = if config.mqtt.enabled {
-            Some(Publisher::start(&config.mqtt, &config.plant.name, tz)?)
+            Some(MqttPublisher::start(
+                &config.mqtt,
+                &config.plant.name,
+                tz,
+                crate::VERSION,
+            )?)
         } else {
             None
         };
@@ -150,7 +157,7 @@ impl Service {
         Ok(collectors)
     }
 
-    fn apply_configured_names(config: &Config, inverters: &mut [InverterData]) {
+    fn apply_configured_names(config: &Config, inverters: &mut [InverterPollObservation]) {
         for inverter in inverters {
             if let Some(configured) =
                 config
@@ -158,17 +165,25 @@ impl Service {
                     .iter()
                     .find(|configured| match &configured.communication {
                         InverterCommunication::Ethernet { address, serial } => {
-                            serial.is_some_and(|serial| serial == inverter.serial)
-                                || address
-                                    .as_deref()
-                                    .is_some_and(|address| address == inverter.ip)
+                            serial.is_some_and(|serial| serial == inverter.identity.serial_number)
+                                || address.as_deref().is_some_and(|address| {
+                                    inverter
+                                        .communication
+                                        .endpoint
+                                        .as_ref()
+                                        .is_some_and(|endpoint| endpoint.as_str() == address)
+                                })
                         }
-                        InverterCommunication::Bluetooth { address, .. } => {
-                            address.eq_ignore_ascii_case(&inverter.ip)
-                        }
+                        InverterCommunication::Bluetooth { address, .. } => inverter
+                            .communication
+                            .endpoint
+                            .as_ref()
+                            .is_some_and(|endpoint| {
+                                address.eq_ignore_ascii_case(endpoint.as_str())
+                            }),
                     })
             {
-                inverter.configured_name = Some(configured.name.clone());
+                inverter.identity.configured_name = CanonicalText::new(&configured.name).ok();
             }
         }
     }
@@ -237,16 +252,29 @@ impl Service {
             None
         };
 
-        let mut status_inverters = Vec::new();
-        let mut fresh_inverters = Vec::new();
+        let observed_at = UnixSeconds::new(Utc::now().timestamp());
+        let mut status_cycle = PollCycleObservation {
+            observed_at,
+            inverters: Vec::new(),
+            site_consumption: None,
+        };
+        let mut fresh_cycle = PollCycleObservation {
+            observed_at,
+            inverters: Vec::new(),
+            site_consumption: None,
+        };
         let mut errors = Vec::new();
         let mut successful_collectors = 0usize;
         for configured in &mut self.collectors {
-            match configured.collector.cycle(true, daily).await {
+            match configured.collector.cycle_observations(true, daily).await {
                 Ok(mut collected) => {
-                    Self::apply_configured_names(&self.config, &mut collected);
-                    fresh_inverters.extend(collected.clone());
-                    status_inverters.extend(collected);
+                    Self::apply_configured_names(&self.config, &mut collected.inverters);
+                    fresh_cycle.observed_at = collected.observed_at;
+                    if fresh_cycle.site_consumption.is_none() {
+                        fresh_cycle.site_consumption = collected.site_consumption.clone();
+                    }
+                    fresh_cycle.inverters.extend(collected.inverters.clone());
+                    status_cycle.inverters.extend(collected.inverters);
                     successful_collectors += 1;
                 }
                 Err(error) => {
@@ -256,9 +284,10 @@ impl Service {
                         "inverter poll failed; retrying at next interval"
                     );
                     errors.push(format!("{}: {error}", configured.target));
-                    let mut stale = configured.collector.inverters();
-                    Self::apply_configured_names(&self.config, &mut stale);
-                    status_inverters.extend(stale);
+                    if let Ok(mut stale) = configured.collector.observations() {
+                        Self::apply_configured_names(&self.config, &mut stale.inverters);
+                        status_cycle.inverters.extend(stale.inverters);
+                    }
                 }
             }
         }
@@ -266,49 +295,75 @@ impl Service {
             if daily.is_some() && errors.is_empty() {
                 self.last_daily = Some(today);
             }
-            self.export(&fresh_inverters).await;
+            self.export(&fresh_cycle).await;
         }
         let error = (!errors.is_empty()).then(|| errors.join("; "));
-        self.update_status(&status_inverters, error).await;
+        self.update_status(&status_cycle, error).await;
     }
 
-    async fn export(&mut self, inverters: &[InverterData]) {
-        let spottime = Utc::now().timestamp();
+    async fn export(&mut self, cycle: &PollCycleObservation) {
         let db = &self.db;
 
-        for inverter in inverters {
-            let poll = storage_adapter::identity(inverter).and_then(|identity| {
-                storage_adapter::measurement(inverter, spottime)
-                    .map(|measurement| (identity, measurement))
-            });
-            match poll {
-                Ok((identity, measurement)) => {
-                    if let Err(e) = db.write_poll(&identity, &measurement).await {
-                        error!(serial = inverter.serial, error = %e, "atomic poll database export failed");
+        for inverter in &cycle.inverters {
+            if let Some(live) = inverter.observed() {
+                if let Err(e) = db.write_poll(&inverter.identity, &live.measurement).await {
+                    error!(
+                        serial = inverter.identity.serial_number,
+                        error = %e,
+                        "atomic poll database export failed"
+                    );
+                }
+            }
+            if let Some(samples) = inverter.day_archive.completed() {
+                let samples = samples
+                    .iter()
+                    .map(|sample| InverterEnergySample {
+                        measured_at: sample.measured_at,
+                        total_energy: sample.total_energy,
+                        power: sample.power,
+                    })
+                    .collect::<Vec<_>>();
+                if let Err(e) = db.write_energy_samples(&inverter.identity, &samples).await {
+                    error!(
+                        serial = inverter.identity.serial_number,
+                        error = %e,
+                        "day data export failed"
+                    );
+                }
+            }
+            if let Some(samples) = inverter.month_yield_archive.completed() {
+                let samples = samples
+                    .iter()
+                    .map(|sample| InverterDailyYield {
+                        measured_at: sample.measured_at,
+                        total_energy: sample.total_energy,
+                        daily_energy: sample.daily_energy,
+                    })
+                    .collect::<Vec<_>>();
+                if let Err(e) = db.write_daily_yields(&inverter.identity, &samples).await {
+                    error!(
+                        serial = inverter.identity.serial_number,
+                        error = %e,
+                        "month data export failed"
+                    );
+                }
+            }
+            if let ArchiveOutcome::Complete(events) = &inverter.event_archive {
+                for event in events {
+                    if let Err(e) = self.export_event(event).await {
+                        error!(
+                            serial = inverter.identity.serial_number,
+                            error = %e,
+                            "event export failed"
+                        );
+                        break;
                     }
                 }
-                Err(e) => {
-                    error!(serial = inverter.serial, error = %e, "canonical poll conversion failed");
-                }
             }
         }
-        if let Some(consumption) = storage_adapter::consumption(inverters, spottime) {
-            if let Err(e) = db.write_consumption(&consumption).await {
+        if let Some(consumption) = &cycle.site_consumption {
+            if let Err(e) = db.write_consumption(consumption).await {
                 error!(error = %e, "consumption export failed");
-            }
-        }
-        if let Err(e) = storage_adapter::write_day_data(db, inverters).await {
-            error!(error = %e, "day data export failed");
-        }
-        if let Err(e) = storage_adapter::write_month_data(db, inverters).await {
-            error!(error = %e, "month data export failed");
-        }
-        for inv in inverters {
-            for ev in &inv.event_data {
-                if let Err(e) = self.export_event(inv, ev).await {
-                    error!(error = %e, "event export failed");
-                    break;
-                }
             }
         }
 
@@ -317,13 +372,18 @@ impl Service {
         // append every tick, day is rewritten every tick, month/events
         // only on the daily housekeeping tick.
         if self.config.csv.enabled {
-            let w = crate::csv::CsvWriter::new(&self.config.csv, &self.config.plant.name, self.tz);
+            let w = CsvWriter::new(
+                &self.config.csv,
+                &self.config.plant.name,
+                self.tz,
+                crate::VERSION,
+            );
             for (what, res) in [
-                ("spot", w.export_spot(inverters)),
-                ("battery", w.export_battery(inverters)),
-                ("day", w.export_day(inverters)),
-                ("month", w.export_month(inverters)),
-                ("events", w.export_events(inverters)),
+                ("spot", w.export_spot(cycle)),
+                ("battery", w.export_battery(cycle)),
+                ("day", w.export_day(cycle)),
+                ("month", w.export_month(cycle)),
+                ("events", w.export_events(cycle)),
             ] {
                 if let Err(e) = res {
                     error!(what, error = %e, "csv export failed");
@@ -334,58 +394,97 @@ impl Service {
         if let Some(mqtt) = &self.mqtt {
             let plant = &self.config.plant;
             let sun = if plant.latitude != 0.0 || plant.longitude != 0.0 {
-                Some(daylight::sun_times(
+                let times = daylight::sun_times(
                     plant.latitude,
                     plant.longitude,
                     Utc::now().with_timezone(&self.tz).date_naive(),
                     self.tz,
-                ))
+                );
+                Some(ExportSunTimes {
+                    sunrise: times.sunrise,
+                    sunset: times.sunset,
+                })
             } else {
                 None
             };
-            if let Err(e) = mqtt.publish(inverters, sun).await {
+            if let Err(e) = mqtt.publish(cycle, sun).await {
                 warn!(error = %e, "mqtt publish failed");
             }
         }
     }
 
     /// Render one event to its DB row (db_SQLite_Export semantics).
-    async fn export_event(&self, _inv: &InverterData, ev: &EventData) -> Result<()> {
-        let (old_value, new_value) = ev.old_new_values();
+    async fn export_event(&self, event: &InverterEvent) -> Result<()> {
+        let old_value = event.old_value.as_ref().map(format_event_value);
+        let new_value = event.new_value.as_ref().map(format_event_value);
         Ok(self
             .db
             .export_event(
-                ev.entry_id as i64,
-                ev.datetime,
-                ev.serial,
-                ev.susy_id as i32,
-                ev.event_code as i64,
-                ev.event_type(),
-                ev.event_category(),
-                tags::desc_or(ev.group_tag(), "?"),
-                tags::desc_or(ev.tag, "?"),
+                i64::from(event.entry_id),
+                event.occurred_at.get(),
+                event.serial_number,
+                i32::from(event.susy_id),
+                i64::from(event.event_code),
+                event.event_type.as_str(),
+                event.category.as_str(),
+                tags::desc_or(event.group_tag.get(), "?"),
+                tags::desc_or(event.message_tag.get(), "?"),
                 old_value.as_deref(),
                 new_value.as_deref(),
-                tags::desc_or(ev.user_group_tag(), "?"),
+                tags::desc_or(event.user_group_tag.get(), "?"),
             )
             .await?)
     }
 
-    async fn update_status(&self, inverters: &[InverterData], err: Option<String>) {
+    async fn update_status(&self, cycle: &PollCycleObservation, err: Option<String>) {
         let mut st = self.status.write().await;
-        st.last_poll = Some(Utc::now().timestamp());
+        st.last_poll = Some(cycle.observed_at.get());
         st.last_error = err;
-        st.inverters = inverters
+        st.inverters = cycle
+            .inverters
             .iter()
-            .map(|i| InverterStatus {
-                serial: i.serial,
-                name: i.display_name().to_string(),
-                total_pac: i.total_pac,
-                e_today: i.e_today,
-                e_total: i.e_total,
-                status: tags::desc_or(i.device_status, "?").to_string(),
+            .filter_map(|inverter| {
+                let live = inverter.observed()?;
+                Some(InverterStatus {
+                    serial: inverter.identity.serial_number,
+                    name: inverter.display_name().to_owned(),
+                    total_pac: live
+                        .reported_ac_power
+                        .map(Watts::get)
+                        .or_else(|| {
+                            live.measurement
+                                .ac_power_total_w()
+                                .and_then(|value| i32::try_from(value).ok())
+                        })
+                        .unwrap_or(0),
+                    e_today: live
+                        .measurement
+                        .energy_today
+                        .map(WattHours::get)
+                        .unwrap_or(0),
+                    e_total: live
+                        .measurement
+                        .energy_total
+                        .map(WattHours::get)
+                        .unwrap_or(0),
+                    status: live
+                        .measurement
+                        .device_status
+                        .map(|status| tags::desc_or(status.get(), "?"))
+                        .unwrap_or("?")
+                        .to_owned(),
+                })
             })
             .collect();
+    }
+}
+
+fn format_event_value(value: &EventValue) -> String {
+    match value {
+        EventValue::Integer(value) => value.to_string(),
+        EventValue::Unsigned(value) => value.to_string(),
+        EventValue::Tag(value) => tags::desc_or(value.get(), "?").to_owned(),
+        EventValue::Text(value) => value.as_str().to_owned(),
     }
 }
 
@@ -1601,7 +1700,10 @@ mod tests {
         MpptMeasurement, UnixSeconds, Watts,
     };
     use crate::storage::{local_day_utc_bounds, Db};
-    use smalog_connection::smadata2::inverter::InverterData;
+    use smalog_observation::{
+        ArchiveOutcome, CommunicationIdentity, InverterPollObservation, LiveObservation,
+        LiveOutcome, ProtocolFamily, Transport,
+    };
 
     use super::{
         build_day_metric_rows, build_day_summary, build_month_summary, build_week_summary,
@@ -2391,19 +2493,94 @@ password = "x"
 "#,
         )
         .expect("valid mixed config");
-        let mut ethernet = InverterData::new("192.168.1.50".into());
-        ethernet.device_name = "reported Ethernet name".into();
-        let mut bluetooth = InverterData::new("00:80:25:AA:BB:CC".into());
-        bluetooth.serial = 123;
-        bluetooth.device_name = "reported Bluetooth name".into();
+        let make_inverter =
+            |serial, endpoint: &str, name: &str, transport| InverterPollObservation {
+                identity: InverterIdentity {
+                    serial_number: serial,
+                    susy_id: Some(1),
+                    configured_name: None,
+                    device_name: Some(CanonicalText::new(name).unwrap()),
+                    model: None,
+                    firmware_version: None,
+                    transport: Some(transport),
+                },
+                communication: CommunicationIdentity {
+                    protocol: ProtocolFamily::SmaData2Plus,
+                    transport,
+                    endpoint: Some(CanonicalText::new(endpoint).unwrap()),
+                },
+                live: LiveOutcome::Observed(Box::new(LiveObservation {
+                    inverter_time: None,
+                    wakeup_time: None,
+                    sleep_time: None,
+                    measurement: InverterMeasurement {
+                        measured_at: UnixSeconds::new(0),
+                        ac_power: [None; 3],
+                        ac_current: [None; 3],
+                        ac_voltage: [None; 3],
+                        grid_frequency: None,
+                        grid_import_power: None,
+                        grid_export_power: None,
+                        energy_today: None,
+                        energy_total: None,
+                        operating_time: None,
+                        feed_in_time: None,
+                        device_status: None,
+                        grid_relay_status: None,
+                        temperature: None,
+                        bluetooth_signal: None,
+                        mppts: Vec::new(),
+                        battery: None,
+                    },
+                    reported_ac_power: None,
+                    reported_dc_power: None,
+                    device_class: 8001,
+                    battery_diagnostics: None,
+                })),
+                day_archive: ArchiveOutcome::NotRequested,
+                month_yield_archive: ArchiveOutcome::NotRequested,
+                event_archive: ArchiveOutcome::NotRequested,
+            };
+        let ethernet = make_inverter(
+            0,
+            "192.168.1.50",
+            "reported Ethernet name",
+            Transport::Ethernet,
+        );
+        let bluetooth = make_inverter(
+            123,
+            "00:80:25:AA:BB:CC",
+            "reported Bluetooth name",
+            Transport::Bluetooth,
+        );
         let mut inverters = [ethernet, bluetooth];
 
         Service::apply_configured_names(&config, &mut inverters);
 
-        assert_eq!(inverters[0].device_name, "reported Ethernet name");
-        assert_eq!(inverters[1].device_name, "reported Bluetooth name");
-        assert_eq!(inverters[0].configured_name.as_deref(), Some("Roof"));
-        assert_eq!(inverters[1].configured_name.as_deref(), Some("Garage"));
+        assert_eq!(
+            inverters[0].identity.device_name.as_ref().unwrap().as_str(),
+            "reported Ethernet name"
+        );
+        assert_eq!(
+            inverters[1].identity.device_name.as_ref().unwrap().as_str(),
+            "reported Bluetooth name"
+        );
+        assert_eq!(
+            inverters[0]
+                .identity
+                .configured_name
+                .as_ref()
+                .map(CanonicalText::as_str),
+            Some("Roof")
+        );
+        assert_eq!(
+            inverters[1]
+                .identity
+                .configured_name
+                .as_ref()
+                .map(CanonicalText::as_str),
+            Some("Garage")
+        );
         assert_eq!(
             inverter_target(&config.inverters[0]),
             "Roof (Ethernet 192.168.1.50)"

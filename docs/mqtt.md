@@ -2,7 +2,9 @@
 
 smalog publishes inverter readings to an MQTT broker after every poll
 cycle, using a **native MQTT client** (no `mosquitto_pub` shell-out like
-SBFspot), configured in the [`[mqtt]`](configuration.md#mqtt) section.
+SBFspot), configured in the [`[mqtt]`](configuration.md#mqtt) section. The
+publisher and metric registry live in the standalone
+[`smalog-export`](../src/crates/smalog-export/) crate.
 
 Every reading is published as its own **structured** topic under
 `base_topic` (default `smalog/{serial}`): grouped scalar leaf topics, a

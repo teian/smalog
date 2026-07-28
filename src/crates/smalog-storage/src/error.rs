@@ -15,6 +15,9 @@ pub enum Error {
 
     #[error("invalid canonical value: {0}")]
     InvalidCanonicalValue(String),
+
+    #[error(transparent)]
+    Observation(#[from] smalog_observation::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

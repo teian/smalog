@@ -27,6 +27,7 @@ pub mod bluetooth;
 pub mod collector;
 pub mod connection;
 pub mod error;
+mod observation;
 pub mod smadata1;
 pub mod smadata2;
 pub mod speedwire;

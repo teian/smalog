@@ -478,6 +478,18 @@ fn response_matches(
 
 #[async_trait::async_trait]
 impl Connection for SpeedwireConnection {
+    fn communication(
+        &self,
+    ) -> (
+        smalog_observation::ProtocolFamily,
+        smalog_observation::Transport,
+    ) {
+        (
+            smalog_observation::ProtocolFamily::SmaData2Plus,
+            smalog_observation::Transport::Ethernet,
+        )
+    }
+
     fn devices(&self) -> Vec<DeviceId> {
         self.devices
             .iter()

@@ -30,24 +30,36 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/crates/smalog/Cargo.toml src/crates/smalog/
 COPY src/crates/smalog-connection/Cargo.toml src/crates/smalog-connection/
+COPY src/crates/smalog-export/Cargo.toml src/crates/smalog-export/
+COPY src/crates/smalog-observation/Cargo.toml src/crates/smalog-observation/
 COPY src/crates/smalog-storage/Cargo.toml src/crates/smalog-storage/
+COPY src/crates/smalog-tags/Cargo.toml src/crates/smalog-tags/
 COPY src/crates/smalog-sbfspot-migrator/Cargo.toml src/crates/smalog-sbfspot-migrator/
 COPY src/crates/smalog-schema-benchmark/Cargo.toml src/crates/smalog-schema-benchmark/
 RUN mkdir -p src/crates/smalog/src \
     src/crates/smalog-connection/src \
+    src/crates/smalog-export/src \
+    src/crates/smalog-observation/src \
     src/crates/smalog-storage/src \
+    src/crates/smalog-tags/src \
     src/crates/smalog-sbfspot-migrator/src \
     src/crates/smalog-schema-benchmark/src \
     && echo "fn main() {}" > src/crates/smalog/src/main.rs \
     && echo "" > src/crates/smalog/src/lib.rs \
     && echo "" > src/crates/smalog-connection/src/lib.rs \
+    && echo "" > src/crates/smalog-export/src/lib.rs \
+    && echo "" > src/crates/smalog-observation/src/lib.rs \
     && echo "" > src/crates/smalog-storage/src/lib.rs \
+    && echo "" > src/crates/smalog-tags/src/lib.rs \
     && echo "" > src/crates/smalog-sbfspot-migrator/src/lib.rs \
     && echo "fn main() {}" > src/crates/smalog-schema-benchmark/src/main.rs \
     && cargo build --release --quiet -p smalog ; \
     rm -rf src/crates/smalog/src \
         src/crates/smalog-connection/src \
+        src/crates/smalog-export/src \
+        src/crates/smalog-observation/src \
         src/crates/smalog-storage/src \
+        src/crates/smalog-tags/src \
         src/crates/smalog-sbfspot-migrator/src \
         src/crates/smalog-schema-benchmark/src
 

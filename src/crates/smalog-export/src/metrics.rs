@@ -9,9 +9,10 @@
 use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
 
-use crate::daylight::SunTimes;
-use smalog_connection::smadata2::inverter::{InverterData, NAN_S32};
-use smalog_connection::smadata2::tags;
+use crate::mqtt::SunTimes;
+use crate::view::{from_inverter, ExportInverter, NAN_S32};
+use smalog_observation::InverterPollObservation;
+use smalog_tags as tags;
 
 /// Which device an entity belongs to: the inverter itself, or one of its
 /// MPP-tracker strings (Home Assistant nests strings under the inverter).
@@ -69,7 +70,7 @@ impl Value {
     }
 }
 
-/// Context that isn't carried on [`InverterData`].
+/// Context that is not carried on an inverter observation.
 pub struct Context<'a> {
     /// Configured plant name.
     pub plant_name: &'a str,
@@ -111,7 +112,23 @@ fn temperature_c(raw: i32) -> f64 {
 /// Build every metric for one inverter, limited to the given AC `phases`
 /// (1..=3) and MPP-tracker `trackers`. Battery metrics appear only for
 /// battery/hybrid devices.
-pub fn build(inv: &InverterData, ctx: &Context, phases: &[u8], trackers: &[u8]) -> Vec<Metric> {
+pub fn build(
+    inverter: &InverterPollObservation,
+    ctx: &Context,
+    phases: &[u8],
+    trackers: &[u8],
+) -> Vec<Metric> {
+    from_inverter(inverter)
+        .map(|inverter| build_view(&inverter, ctx, phases, trackers))
+        .unwrap_or_default()
+}
+
+pub(crate) fn build_view(
+    inv: &ExportInverter,
+    ctx: &Context,
+    phases: &[u8],
+    trackers: &[u8],
+) -> Vec<Metric> {
     let mut out: Vec<Metric> = Vec::new();
 
     // --- AC ---

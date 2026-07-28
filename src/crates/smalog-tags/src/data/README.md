@@ -1,6 +1,6 @@
 # SMA tag translations
 
-The `tags-<locale>.json` files contain the embedded translations used for SMA
+This directory's `tags-<locale>.json` files contain the embedded translations used for SMA
 status, event and device tags. They are structured UTF-8 JSON documents and
 can be edited with any text editor or JSON-aware IDE.
 

@@ -4,9 +4,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use smalog::config::CsvConfig;
-use smalog::connection::smadata2::inverter::{DayData, InverterData, Mppt};
-use smalog::csv::CsvWriter;
+use smalog_export::{CsvConfig, CsvWriter};
+use smalog_observation::{
+    ArchiveOutcome, CanonicalText, DayArchiveSample, InverterPollObservation, MilliVolts,
+    Milliamperes, Millihertz, MpptMeasurement, WattHours, Watts,
+};
+
+mod support;
+use support::{cycle, inverter, live};
 
 /// 2023-11-14 22:15:00 UTC — a fixed instant so filenames are stable.
 const T: i64 = 1_700_000_100;
@@ -20,36 +25,29 @@ fn cfg(dir: &Path) -> CsvConfig {
     }
 }
 
-fn solar() -> InverterData {
-    let mut inv = InverterData::new("10.0.0.9".into());
-    inv.serial = 2_000_123_456;
-    inv.dev_class = 8001;
-    inv.device_name = "SB5.0".into();
-    inv.device_type = "STP5000".into();
-    inv.inverter_datetime = T;
-    inv.total_pac = 4200;
-    inv.pac1 = 4200;
-    inv.e_today = 12_345;
-    inv.e_total = 9_000_000;
-    inv.grid_freq = 5001;
-    inv.mpp.insert(
-        1,
-        Mppt {
-            pdc: 2100,
-            udc: 33_000,
-            idc: 6400,
+fn solar() -> InverterPollObservation {
+    let mut inv = inverter(2_000_123_456, "SB5.0", "STP5000", T);
+    let live = live(&mut inv);
+    live.reported_ac_power = Some(Watts::new(4_200));
+    live.reported_dc_power = Some(Watts::new(4_200));
+    live.measurement.ac_power[0] = Some(Watts::new(4_200));
+    live.measurement.energy_today = Some(WattHours::new(12_345));
+    live.measurement.energy_total = Some(WattHours::new(9_000_000));
+    live.measurement.grid_frequency = Some(Millihertz::new(50_010));
+    live.measurement.mppts = vec![
+        MpptMeasurement {
+            tracker_number: 1,
+            dc_power: Some(Watts::new(2_100)),
+            dc_voltage: Some(MilliVolts::new(330_000)),
+            dc_current: Some(Milliamperes::new(6_400)),
         },
-    );
-    inv.mpp.insert(
-        2,
-        Mppt {
-            pdc: 2100,
-            udc: 33_000,
-            idc: 6400,
+        MpptMeasurement {
+            tracker_number: 2,
+            dc_power: Some(Watts::new(2_100)),
+            dc_voltage: Some(MilliVolts::new(330_000)),
+            dc_current: Some(Milliamperes::new(6_400)),
         },
-    );
-    inv.cal_pdc_tot = 4200;
-    inv.cal_efficiency = 100.0;
+    ];
     inv
 }
 
@@ -68,10 +66,11 @@ fn find_csv(root: &Path) -> Option<PathBuf> {
     None
 }
 
-fn export_spot_body(dir: &Path, inverters: &[InverterData]) -> String {
+fn export_spot_body(dir: &Path, inverters: Vec<InverterPollObservation>) -> String {
     let cfg = cfg(dir);
-    CsvWriter::new(&cfg, "TestPlant", "UTC".parse().unwrap())
-        .export_spot(inverters)
+    let cycle = cycle(inverters, T);
+    CsvWriter::new(&cfg, "TestPlant", "UTC".parse().unwrap(), "test")
+        .export_spot(&cycle)
         .unwrap();
     fs::read_to_string(find_csv(dir).unwrap()).unwrap()
 }
@@ -80,13 +79,7 @@ fn export_spot_body(dir: &Path, inverters: &[InverterData]) -> String {
 fn spot_csv_writes_header_and_row() {
     let dir = tempfile::tempdir().unwrap();
     let inv = solar();
-    let canonical = smalog::storage_adapter::measurement(&inv, T).unwrap();
-    assert_eq!(
-        canonical.mppts[0].dc_voltage.unwrap().get(),
-        330_000,
-        "protocol centivolts convert explicitly to canonical millivolts"
-    );
-    let body = export_spot_body(dir.path(), &[inv]);
+    let body = export_spot_body(dir.path(), vec![inv]);
 
     let file = find_csv(dir.path()).expect("a spot csv file");
     assert!(
@@ -116,52 +109,44 @@ fn spot_csv_writes_header_and_row() {
 
 #[test]
 fn spot_csv_represents_empty_one_sparse_and_tracker_255() {
-    type CsvTrackerCase<'a> = (&'a [(u8, Mppt)], &'a str, &'a str);
+    type CsvTrackerCase<'a> = (&'a [MpptMeasurement], &'a str, &'a str);
     let cases: &[CsvTrackerCase<'_>] = &[
         (&[], "Serial;Pac1", "2000123456;4200.000"),
         (
-            &[(
-                7,
-                Mppt {
-                    pdc: 0,
-                    udc: 0,
-                    idc: 0,
-                },
-            )],
+            &[MpptMeasurement {
+                tracker_number: 7,
+                dc_power: Some(Watts::new(0)),
+                dc_voltage: Some(MilliVolts::new(0)),
+                dc_current: Some(Milliamperes::new(0)),
+            }],
             "Serial;Pdc7;Idc7;Udc7;Pac1",
             "2000123456;0.000;0.000;0.000;4200.000",
         ),
         (
             &[
-                (
-                    2,
-                    Mppt {
-                        pdc: 202,
-                        udc: 20_002,
-                        idc: 2_002,
-                    },
-                ),
-                (
-                    255,
-                    Mppt {
-                        pdc: 255,
-                        udc: 25_500,
-                        idc: 2_550,
-                    },
-                ),
+                MpptMeasurement {
+                    tracker_number: 2,
+                    dc_power: Some(Watts::new(202)),
+                    dc_voltage: Some(MilliVolts::new(200_020)),
+                    dc_current: Some(Milliamperes::new(2_002)),
+                },
+                MpptMeasurement {
+                    tracker_number: 255,
+                    dc_power: Some(Watts::new(255)),
+                    dc_voltage: Some(MilliVolts::new(255_000)),
+                    dc_current: Some(Milliamperes::new(2_550)),
+                },
             ],
             "Serial;Pdc2;Pdc255;Idc2;Idc255;Udc2;Udc255;Pac1",
             "2000123456;202.000;255.000;2.002;2.550;200.020;255.000;4200.000",
         ),
         (
-            &[(
-                255,
-                Mppt {
-                    pdc: 255,
-                    udc: 25_500,
-                    idc: 2_550,
-                },
-            )],
+            &[MpptMeasurement {
+                tracker_number: 255,
+                dc_power: Some(Watts::new(255)),
+                dc_voltage: Some(MilliVolts::new(255_000)),
+                dc_current: Some(Milliamperes::new(2_550)),
+            }],
             "Serial;Pdc255;Idc255;Udc255;Pac1",
             "2000123456;255.000;2.550;255.000;4200.000",
         ),
@@ -170,9 +155,8 @@ fn spot_csv_represents_empty_one_sparse_and_tracker_255() {
     for (trackers, expected_header, expected_row) in cases {
         let dir = tempfile::tempdir().unwrap();
         let mut inv = solar();
-        inv.mpp.clear();
-        inv.mpp.extend(trackers.iter().copied());
-        let body = export_spot_body(dir.path(), &[inv]);
+        live(&mut inv).measurement.mppts = trackers.to_vec();
+        let body = export_spot_body(dir.path(), vec![inv]);
         assert!(
             body.contains(expected_header),
             "missing tracker header {expected_header} in {body}"
@@ -188,28 +172,22 @@ fn spot_csv_represents_empty_one_sparse_and_tracker_255() {
 fn spot_csv_aligns_sparse_trackers_across_inverters() {
     let dir = tempfile::tempdir().unwrap();
     let mut tracker_two = solar();
-    tracker_two.mpp.clear();
-    tracker_two.mpp.insert(
-        2,
-        Mppt {
-            pdc: 202,
-            udc: 20_002,
-            idc: 2_002,
-        },
-    );
+    live(&mut tracker_two).measurement.mppts = vec![MpptMeasurement {
+        tracker_number: 2,
+        dc_power: Some(Watts::new(202)),
+        dc_voltage: Some(MilliVolts::new(200_020)),
+        dc_current: Some(Milliamperes::new(2_002)),
+    }];
     let mut tracker_255 = solar();
-    tracker_255.serial += 1;
-    tracker_255.mpp.clear();
-    tracker_255.mpp.insert(
-        255,
-        Mppt {
-            pdc: 255,
-            udc: 25_500,
-            idc: 2_550,
-        },
-    );
+    tracker_255.identity.serial_number += 1;
+    live(&mut tracker_255).measurement.mppts = vec![MpptMeasurement {
+        tracker_number: 255,
+        dc_power: Some(Watts::new(255)),
+        dc_voltage: Some(MilliVolts::new(255_000)),
+        dc_current: Some(Milliamperes::new(2_550)),
+    }];
 
-    let body = export_spot_body(dir.path(), &[tracker_two, tracker_255]);
+    let body = export_spot_body(dir.path(), vec![tracker_two, tracker_255]);
     assert!(body.contains("2000123456;202.000;;2.002;;200.020;;4200.000"));
     assert!(body.contains("2000123457;;255.000;;2.550;;255.000;4200.000"));
 }
@@ -218,10 +196,10 @@ fn spot_csv_aligns_sparse_trackers_across_inverters() {
 fn spot_csv_identity_text_is_valid_utf8() {
     let dir = tempfile::tempdir().unwrap();
     let mut inv = solar();
-    inv.configured_name = Some("Grüße aus 東京 🌞".into());
-    inv.device_type = "Wechselrichter Δ".into();
+    inv.identity.configured_name = Some(CanonicalText::new("Grüße aus 東京 🌞").unwrap());
+    inv.identity.model = Some(CanonicalText::new("Wechselrichter Δ").unwrap());
 
-    let body = export_spot_body(dir.path(), &[inv]);
+    let body = export_spot_body(dir.path(), vec![inv]);
     assert!(body.contains("Grüße aus 東京 🌞;Wechselrichter Δ"));
     assert!(!body.contains('\u{fffd}'));
 }
@@ -233,8 +211,9 @@ fn spot_csv_appends_without_repeating_header() {
     let cfg = cfg(dir.path());
 
     for _ in 0..3 {
-        CsvWriter::new(&cfg, "TestPlant", tz)
-            .export_spot(&[solar()])
+        let cycle = cycle(vec![solar()], T);
+        CsvWriter::new(&cfg, "TestPlant", tz, "test")
+            .export_spot(&cycle)
             .unwrap();
     }
     let body = fs::read_to_string(find_csv(dir.path()).unwrap()).unwrap();
@@ -253,20 +232,24 @@ fn day_csv_writes_five_minute_rows() {
     let cfg = cfg(dir.path());
 
     let mut inv = solar();
-    inv.has_day_data = true;
-    inv.day_data[0] = DayData {
-        datetime: T,
-        total_wh: 1_000,
-        watt: 500,
-    };
-    inv.day_data[1] = DayData {
-        datetime: T + 300,
-        total_wh: 1_100,
-        watt: 600,
-    };
+    inv.day_archive = ArchiveOutcome::Complete(vec![
+        DayArchiveSample {
+            slot: 0,
+            measured_at: smalog_observation::UnixSeconds::new(T),
+            total_energy: WattHours::new(1_000),
+            power: Watts::new(500),
+        },
+        DayArchiveSample {
+            slot: 1,
+            measured_at: smalog_observation::UnixSeconds::new(T + 300),
+            total_energy: WattHours::new(1_100),
+            power: Watts::new(600),
+        },
+    ]);
+    let cycle = cycle(vec![inv], T);
 
-    CsvWriter::new(&cfg, "TestPlant", tz)
-        .export_day(&[inv])
+    CsvWriter::new(&cfg, "TestPlant", tz, "test")
+        .export_day(&cycle)
         .unwrap();
 
     let body = fs::read_to_string(find_csv(dir.path()).unwrap()).unwrap();
@@ -286,8 +269,9 @@ fn comma_decimal_and_delimiter() {
         ..cfg(dir.path())
     };
 
-    CsvWriter::new(&cfg, "P", tz)
-        .export_spot(&[solar()])
+    let cycle = cycle(vec![solar()], T);
+    CsvWriter::new(&cfg, "P", tz, "test")
+        .export_spot(&cycle)
         .unwrap();
     let body = fs::read_to_string(find_csv(dir.path()).unwrap()).unwrap();
     assert!(body.contains("12,345"), "comma decimal separator used");

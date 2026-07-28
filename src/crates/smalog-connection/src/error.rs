@@ -6,6 +6,10 @@ use thiserror::Error;
 /// Errors from talking to SMA inverters over any supported connection.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A decoded value could not form a canonical observation.
+    #[error(transparent)]
+    Observation(#[from] smalog_observation::Error),
+
     /// Underlying socket / I/O failure.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

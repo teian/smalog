@@ -19,8 +19,8 @@ pub enum Error {
     #[error(transparent)]
     Storage(#[from] smalog_storage::Error),
 
-    #[error("mqtt error: {0}")]
-    Mqtt(String),
+    #[error(transparent)]
+    Export(#[from] smalog_export::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

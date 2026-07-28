@@ -24,8 +24,9 @@ use chrono_tz::Tz;
 
 use crate::config::{CsvConfig, SpotTimeSource};
 use crate::error::{Error, Result};
-use smalog_connection::smadata2::inverter::{InverterData, NAN_S32};
-use smalog_connection::smadata2::tags;
+use crate::view::{from_cycle, EventData, ExportInverter, NAN_S32};
+use smalog_observation::PollCycleObservation;
+use smalog_tags as tags;
 
 /// SBFspot's SolarInverter device class — the only class written to the
 /// spot CSV.
@@ -39,10 +40,11 @@ pub struct CsvWriter<'a> {
     delim: char,
     dp: char,
     prec: usize,
+    version: &'a str,
 }
 
 impl<'a> CsvWriter<'a> {
-    pub fn new(cfg: &'a CsvConfig, plant: &'a str, tz: Tz) -> Self {
+    pub fn new(cfg: &'a CsvConfig, plant: &'a str, tz: Tz, version: &'a str) -> Self {
         CsvWriter {
             cfg,
             plant,
@@ -50,6 +52,7 @@ impl<'a> CsvWriter<'a> {
             delim: cfg.delimiter.chars().next().unwrap_or(';'),
             dp: cfg.decimal_point.chars().next().unwrap_or('.'),
             prec: cfg.precision as usize,
+            version,
         }
     }
 
@@ -117,7 +120,7 @@ impl<'a> CsvWriter<'a> {
         format!(
             "sep={}\nVersion CSV1|Tool smalog{} ({os})|Linebreaks LF|Delimiter {}|Decimalpoint {}|Precision {}\n\n",
             self.delim,
-            crate::VERSION,
+            self.version,
             delim_txt,
             dp_txt,
             self.prec,
@@ -129,7 +132,9 @@ impl<'a> CsvWriter<'a> {
     /// Spot data — one row per solar inverter, appended to a per-day file
     /// (`<plant>-Spot-YYYYMMDD.csv`); header written only when the file is
     /// newly created (ExportSpotDataToCSV).
-    pub fn export_spot(&self, inverters: &[InverterData]) -> Result<()> {
+    pub fn export_spot(&self, cycle: &PollCycleObservation) -> Result<()> {
+        let inverters = from_cycle(cycle);
+        let inverters = inverters.as_slice();
         let spottime = self.spot_time(inverters);
         if spottime == 0 {
             return Ok(());
@@ -220,7 +225,7 @@ impl<'a> CsvWriter<'a> {
 
     /// Push Pdc/Idc/Udc blocks aligned to the union of observed tracker IDs.
     /// Missing trackers stay empty, preserving multi-inverter column alignment.
-    fn push_mppt(&self, cells: &mut Vec<String>, inv: &InverterData, trackers: &[u8]) {
+    fn push_mppt(&self, cells: &mut Vec<String>, inv: &ExportInverter, trackers: &[u8]) {
         for tracker in trackers {
             cells.push(
                 inv.mpp
@@ -247,7 +252,7 @@ impl<'a> CsvWriter<'a> {
         }
     }
 
-    fn spot_time(&self, inverters: &[InverterData]) -> i64 {
+    fn spot_time(&self, inverters: &[ExportInverter]) -> i64 {
         match self.cfg.spot_time_source {
             SpotTimeSource::Computer => Utc::now().timestamp(),
             SpotTimeSource::Inverter => inverters
@@ -261,7 +266,9 @@ impl<'a> CsvWriter<'a> {
     /// Battery data — one row per battery inverter, appended to
     /// `<plant>-Battery-YYYYMMDD.csv` (ExportBatteryDataToCSV, always PC
     /// time).
-    pub fn export_battery(&self, inverters: &[InverterData]) -> Result<()> {
+    pub fn export_battery(&self, cycle: &PollCycleObservation) -> Result<()> {
+        let inverters = from_cycle(cycle);
+        let inverters = inverters.as_slice();
         if !inverters.iter().any(|i| i.has_battery) {
             return Ok(());
         }
@@ -321,8 +328,9 @@ impl<'a> CsvWriter<'a> {
 
     /// Day data — 5-minute yield, one file per day, fully rewritten
     /// (ExportDayDataToCSV).
-    pub fn export_day(&self, inverters: &[InverterData]) -> Result<()> {
-        let with_day: Vec<&InverterData> = inverters.iter().filter(|i| i.has_day_data).collect();
+    pub fn export_day(&self, cycle: &PollCycleObservation) -> Result<()> {
+        let inverters = from_cycle(cycle);
+        let with_day: Vec<&ExportInverter> = inverters.iter().filter(|i| i.has_day_data).collect();
         if with_day.is_empty() {
             return Ok(());
         }
@@ -380,8 +388,9 @@ impl<'a> CsvWriter<'a> {
     /// Month data — daily totals, one file per month, fully rewritten.
     /// Note the SBFspot time-base quirk: folder from the (local) day slot,
     /// filename + data dates in GMT (ExportMonthDataToCSV).
-    pub fn export_month(&self, inverters: &[InverterData]) -> Result<()> {
-        let with_month: Vec<&InverterData> =
+    pub fn export_month(&self, cycle: &PollCycleObservation) -> Result<()> {
+        let inverters = from_cycle(cycle);
+        let with_month: Vec<&ExportInverter> =
             inverters.iter().filter(|i| i.has_month_data).collect();
         let Some(first) = with_month.first() else {
             return Ok(());
@@ -446,13 +455,11 @@ impl<'a> CsvWriter<'a> {
 
     /// Event data — one file per user group, fully rewritten
     /// (ExportEventsToCSV). Fields use a *trailing* delimiter.
-    pub fn export_events(&self, inverters: &[InverterData]) -> Result<()> {
+    pub fn export_events(&self, cycle: &PollCycleObservation) -> Result<()> {
+        let inverters = from_cycle(cycle);
         // Group events by the user group they were queried as.
         for (ug_code, label) in [(0x07u32, "User"), (0x0A, "Installer")] {
-            let events: Vec<(
-                &InverterData,
-                &smalog_connection::smadata2::inverter::EventData,
-            )> = inverters
+            let events: Vec<(&ExportInverter, &EventData)> = inverters
                 .iter()
                 .flat_map(|inv| inv.event_data.iter().map(move |ev| (inv, ev)))
                 .filter(|(_, ev)| ev.user_group == ug_code)
@@ -520,7 +527,12 @@ impl<'a> CsvWriter<'a> {
 
     /// Per-inverter extended-header line (two repeated labels per
     /// inverter), each line starting with a delimiter.
-    fn per_inv_header(&self, f: &mut File, invs: &[&InverterData], labels: &[&str]) -> Result<()> {
+    fn per_inv_header(
+        &self,
+        f: &mut File,
+        invs: &[&ExportInverter],
+        labels: &[&str],
+    ) -> Result<()> {
         let mut line = String::new();
         for _ in invs {
             for l in labels {
@@ -532,7 +544,7 @@ impl<'a> CsvWriter<'a> {
         Ok(())
     }
 
-    fn per_inv_serial(&self, f: &mut File, invs: &[&InverterData]) -> Result<()> {
+    fn per_inv_serial(&self, f: &mut File, invs: &[&ExportInverter]) -> Result<()> {
         let mut line = String::new();
         for inv in invs {
             line.push(self.delim);

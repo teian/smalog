@@ -1,0 +1,12 @@
+[package]
+name = "smalog-tags"
+version = "0.1.0"
+edition = "2021"
+description = "Localized SMA tag catalog for smalog"
+license = "EUPL-1.2"
+repository = "https://github.com/teian/smalog"
+rust-version = "1.85"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

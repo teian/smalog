@@ -79,8 +79,10 @@ multi-crate ceremony.
 > [`smalog-observation`](../src/crates/smalog-observation/) for the canonical
 > protocol-neutral Poll Cycle contract,
 > [`smalog-storage`](../src/crates/smalog-storage/) for persistence,
-> [`smalog-export`](../src/crates/smalog-export/) for external output, and the
-> [`smalog`](../src/crates/smalog/) binary that wraps it. Two intentional
+> [`smalog-export`](../src/crates/smalog-export/) for external output,
+> [`smalog-tags`](../src/crates/smalog-tags/) for localized catalogs, two
+> standalone migration/benchmark tools, and the
+> [`smalog`](../src/crates/smalog/) binary that composes them. Two intentional
 > deviations from the template above: crates live
 > under `src/crates/<name>` (not `crates/`), and the license is
 > `EUPL-1.2`, not MIT/Apache. Dependency
@@ -104,14 +106,14 @@ src/crates/smalog-connection/src/
 ├── error.rs              # crate-wide error type
 ├── collector.rs          # the unified poll loop
 ├── connection.rs         # common Connection trait
+├── observation.rs        # private conversion to canonical observations
 ├── smadata2.rs           # shared SMA Data2+ application protocol
 ├── smadata2/
 │   ├── commands.rs       # command / LRI constants
 │   ├── decode.rs         # record decoding
 │   ├── archive.rs        # day/month/event parsing
 │   ├── inverter.rs       # InverterData state
-│   ├── tags.rs           # SMA tag text lookup
-│   └── data/             # embedded localized UTF-8 JSON tag documents
+│   └── tags.rs           # compatibility re-export from smalog-tags
 ├── bluetooth.rs          # SMA Data 2 Plus over RFCOMM
 ├── bluetooth/
 │   ├── frame.rs
@@ -129,6 +131,10 @@ src/crates/smalog-connection/src/
     ├── rs485.rs          # SMA-Net multi-point boundary
     └── powerline.rs      # Sunny-Net/Powerline boundary
 ```
+
+The embedded localized JSON documents live in the separate
+[`smalog-tags`](../src/crates/smalog-tags/) leaf crate. Protocol results carry
+tag IDs; exporters resolve localized text only at the presentation boundary.
 
 Rules of thumb:
 - `lib.rs` should mostly be `pub mod` declarations + re-exports (a "table of contents"), not logic.

@@ -25,8 +25,8 @@ Related docs: [database](database.md) ·
   variable `NAME` *before* the TOML is parsed. See
   [Secrets](#secrets) below.
 - **Required vs optional sections.** `[plant]`, `[database]` and at least
-  one `[[inverter]]` are mandatory. `[service]`, `[log]`, `[archive]`
-  and `[mqtt]` are optional and fall back to defaults.
+  one `[[inverter]]` are mandatory. `[service]`, `[log]`, `[archive]`,
+  `[csv]` and `[mqtt]` are optional and fall back to defaults.
 
 ## Top-level keys
 
@@ -34,7 +34,7 @@ Set before the first `[section]` header.
 
 | Key | Type | Default | Meaning / valid values |
 |-----|------|---------|------------------------|
-| `locale` | string | `"en-US"` | Language for event texts and CSV headers (SBFspot `Locale`). One of `en-US`, `de-DE`, `es-ES`, `fr-FR`, `it-IT`, `nl-NL`, or the bare language code (`de`, `fr`, …). Selects the corresponding embedded UTF-8 `tags-<locale>.json` document. |
+| `locale` | string | `"en-US"` | Language for event texts and CSV headers (SBFspot `Locale`). One of `en-US`, `de-DE`, `es-ES`, `fr-FR`, `it-IT`, `nl-NL`, or the bare language code (`de`, `fr`, …). Selects the corresponding UTF-8 JSON catalog embedded by [`smalog-tags`](../src/crates/smalog-tags/). |
 
 ## `[service]`
 

@@ -12,23 +12,26 @@ inverters.
 
 ## Inverter Fleet
 
-An **Inverter Fleet** is the deep connection module that owns configured
-inverter communication. Its external interface exposes exactly three
-operations:
+An **Inverter Fleet** is the domain boundary that owns configured inverter
+communication. The current implementation is composed from the app's
+configured collectors and the connection crate. At that boundary, callers
+use three kinds of operation:
 
-- `poll` performs one complete hardware-side Poll Cycle;
-- `probe` performs read-only connectivity or data diagnostics;
-- `set_clock` performs an explicitly requested clock operation.
+- polling (`Collector::cycle_observations`) performs one complete
+  hardware-side Poll Cycle and returns canonical observations;
+- probing (`Collector::probe` / `probe_all`) performs read-only connectivity
+  or data diagnostics;
+- clock operations use the connection's `set_clock` capability.
 
-Each operation owns connection establishment, device resolution, login,
-protocol work, per-inverter outcome attribution, and best-effort cleanup.
-Callers cannot control or reorder those lifecycle steps.
+The collector owns connection establishment, device resolution, login,
+protocol work and best-effort cleanup for polling and probing. Application
+code does not reorder the `begin → login → request → end` lifecycle.
 
-The Inverter Fleet interface is protocol-neutral. Speedwire and Bluetooth
-share an internal SMA Data 2 Plus implementation using their native transport
-adapters. SMA Data V1 has a separate internal implementation for RS232, RS485,
-and Powerline. Ethernet datagrams, Bluetooth frames, SMA commands, fragments,
-and protocol sentinels do not cross the external Inverter Fleet seam.
+The Poll Cycle result is protocol-neutral. Speedwire and Bluetooth share an
+internal SMA Data 2 Plus implementation using their native transport adapters.
+SMA Data V1 has separate non-operational boundaries for RS232, RS485 and
+Powerline. Ethernet datagrams, Bluetooth frames, SMA commands, fragments and
+protocol sentinels do not cross into storage, export or runtime presentation.
 
 ## Daily Archive
 
@@ -44,12 +47,18 @@ A **Daily Archive Area** is one independently retried part of a Daily Archive:
 
 ## Daily Archive Completion
 
-**Daily Archive Completion** is tracked independently for each inverter. It
-means that the required Daily Archive data for that inverter has been
-successfully persisted to the database. CSV and MQTT results do not determine
-or block Daily Archive Completion.
+The following describes the target durability invariant. The current service
+has not implemented it yet: it keeps one process-local `last_daily` date and
+retries the combined daily collection only when a collector fails. A restart
+therefore triggers collection again, while a database write failure does not
+currently preserve a per-inverter retry marker.
 
-Completion is tracked separately for every enabled Daily Archive Area. An
+Once implemented, **Daily Archive Completion** will be tracked independently
+for each inverter. It means that the required Daily Archive data for that
+inverter has been successfully persisted to the database. CSV and MQTT results
+do not determine or block Daily Archive Completion.
+
+Completion must be tracked separately for every enabled Daily Archive Area. An
 inverter reaches Daily Archive Completion only after all of its enabled areas
 are complete.
 
@@ -57,10 +66,10 @@ Failed required database persistence leaves the affected area incomplete and
 must be retried on a later Poll Cycle. It does not reset another completed area
 or block Daily Archive Completion for another inverter.
 
-The completion state is durable database state keyed by local calendar date,
-inverter, and Daily Archive Area. The area completion marker and its archive
-data are persisted in the same database transaction. Process-local state such
-as a single `last_daily` date is not authoritative.
+The target completion state is durable database state keyed by local calendar
+date, inverter and Daily Archive Area. The area completion marker and its
+archive data must be persisted in the same database transaction. Process-local
+state such as a single `last_daily` date is not authoritative.
 
 A successful archive request with a valid empty result completes its area.
 Event collection completes when the requested period has been processed or the

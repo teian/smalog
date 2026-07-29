@@ -271,6 +271,7 @@ For the service's chart-ready JSON, prefer
 
 See also: [configuration](configuration.md#database) ·
 [migration guide](migration-sbfspot.md) ·
-[capacity benchmark](schema-v1-capacity-benchmark.md) ·
+[schema benchmark crate](../src/crates/smalog-schema-benchmark/) ·
 [operations](operations.md) ·
-[schema specification](../specs/database-schema-v1.md).
+[SQLite schema](../src/crates/smalog-storage/migrations/sqlite/0001_smalog_schema_v1.sql) ·
+[PostgreSQL schema](../src/crates/smalog-storage/migrations/postgres/0001_smalog_schema_v1.sql).

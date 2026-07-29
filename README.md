@@ -17,8 +17,9 @@ migrator.
 
 ## Features
 
-- **One service, many inverters** — a single instance polls every
-  inverter in the config over one shared UDP socket.
+- **One service, many inverters** — a single instance polls every configured
+  inverter. Speedwire devices share one UDP socket; Bluetooth devices use
+  independent RFCOMM sessions.
 - **SMA Speedwire (ethernet) protocol** — discovery, login, spot data,
   and day/month/event archives, implemented in Rust using protocol behavior
   and accumulated fixes documented by SBFspot as a reference.
@@ -457,7 +458,8 @@ All take `--config <path>` (default `/etc/smalog/config.toml`).
   and rollback.
 - [CSV export](docs/csv.md) — SBFspot-compatible files, formatting, scope.
 - [MQTT](docs/mqtt.md) — the full item-key list and payload format.
-- [Bluetooth](docs/bluetooth.md) — optional RFCOMM transport (Linux only).
+- [Bluetooth](docs/bluetooth.md) — optional RFCOMM transport on Linux and
+  Windows.
 - [Connections and protocol](docs/connections.md) — common interface,
   SMA Data 2 Plus over Speedwire/Bluetooth and SMA Data V1 over
   RS232/RS485/Powerline.
@@ -465,6 +467,8 @@ All take `--config <path>` (default `/etc/smalog/config.toml`).
 - [Docker](docs/docker.md) — multi-arch build, compose, networking.
 - [Operations](docs/operations.md) — systemd, endpoints, first run.
 - [Architecture](docs/architecture.md) — how the modules fit together.
+- [Domain glossary](CONTEXT.md) — Poll Cycle, Inverter Fleet, archive
+  completion and best-effort export terminology.
 - [Rust style](docs/rust-style.md) — workspace/module/error/style conventions.
 
 ## Differences from SBFspot

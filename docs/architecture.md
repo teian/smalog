@@ -2,7 +2,9 @@
 
 **smalog — SMA inverter logger** is a Cargo **workspace** with eight crates
 plus a web UI. For the connection and byte-level wire formats see
-[connections.md](connections.md); this page is the module-level map.
+[connections.md](connections.md); domain terms and target invariants are
+defined in the [domain glossary](../CONTEXT.md). This page is the module-level
+map of the current implementation.
 
 ```
 repo/
@@ -24,43 +26,46 @@ repo/
 ## Layers
 
 ```
-              ┌─────────────────────────────────────────────┐
-   smalog     │          service and migration CLI          │
-   (app)      │ ticks · daylight · orchestration · HTTP/API │
-              └───────┬───────────────┬──────────────┬──────┘
-                      │               │              │
-              ┌───────▼─────────┐ ┌───▼──────────┐ ┌─▼─────────────────┐
-              │smalog-storage   │ │smalog-export │ │SBFspot migrator   │
-              │SQLite|Postgres  │ │CSV · MQTT    │ │SQLite→schema v1   │
-              └───────▲─────────┘ └──────▲───────┘ └─────────┬─────────┘
-                      │                  │                    │
-                      └──────────┬───────┘                    │
-                         PollCycleObservation                 │
-                      ┌──────────▼────────────┐                │
-                      │ smalog-observation   │◄───────────────┘
-                      │ typed units/outcomes │
-                      └──────────────────────┘
+                    ┌───────────────────────────────────────────┐
+       smalog       │ ticks · daylight · orchestration · API   │
+                    └───────────────┬───────────────────────────┘
+                                    │ poll
+                    ┌───────────────▼───────────────────────────┐
+smalog-connection   │ Collector over dyn Connection             │
+                    │ begin → login → request → end              │
+                    └───────┬─────────────────────────────┬─────┘
+                            │                             │
+             ┌──────────────▼─────────────┐  ┌────────────▼─────────────┐
+             │ SMA Data 2 Plus           │  │ SMA Data V1 boundaries  │
+             │ Speedwire · Bluetooth     │  │ RS232 · RS485 · Powerline│
+             └──────────────┬─────────────┘  └──────────────────────────┘
+                            │
+                            │ cycle_observations()
+                    ┌───────▼───────────────────────┐
+smalog-observation  │ PollCycleObservation          │
+                    │ typed units · outcomes        │
+                    └───────┬───────────────┬──────┘
+                            │               │
+                 ┌──────────▼───────┐ ┌─────▼────────────┐
+smalog-storage   │ SQLite/Postgres │ │ smalog-export    │
+                 │ canonical writes│ │ CSV · MQTT       │
+                 └─────────────────┘ └──────────────────┘
 
-                 cycle_observations() → PollCycleObservation
-           ┌────────────────────────────────────────────────────┐
-connection │                     Collector                      │
-  crate    │            one poll loop, any Connection           │
-           └───────────────────────┬────────────────────────────┘
-                     dyn Connection│ begin/login/request/end
-          ┌────────────────────────┼─────────────────────────┐
-┌─────────▼───────────┐  ┌─────────▼───────────┐  ┌─────────▼───────────┐
-│ SpeedwireConnection │  │BluetoothConnection │  │ SmaData1Connection    │
-│ Ethernet / UDP 9522 │  │ RFCOMM             │  │ SMA Data V1         │
-│ SMA Data 2 Plus     │  │ SMA Data 2 Plus    │  │ RS232 · RS485      │
-└─────────┬───────────┘  └─────────┬───────────┘  │ Powerline (TODO)  │
-          │                         │              └───────────────────┘
-          └────────────┬────────────┘
-             normalized Speedwire frames
-           ┌───────────▼────────────────────────────────────┐
-           │ smadata2                                      │
-           │ commands · decode · archive · inverter · tags │
-           └────────────────────────────────────────────────┘
+SBFspot migration: legacy SQLite → smalog-sbfspot-migrator → smalog-storage
 ```
+
+## Crate dependency boundaries
+
+| Crate | Workspace dependencies |
+|---|---|
+| `smalog-observation` | none; canonical leaf types |
+| `smalog-tags` | none; localized UTF-8 catalog |
+| `smalog-connection` | `smalog-observation`, `smalog-tags` |
+| `smalog-storage` | `smalog-observation` |
+| `smalog-export` | `smalog-observation`, `smalog-tags` |
+| `smalog-sbfspot-migrator` | `smalog-storage`, plus connection LRIs for legacy mapping |
+| `smalog-schema-benchmark` | `smalog-storage` |
+| `smalog` | composes all runtime and migration crates |
 
 ## The `smalog-connection` crate
 
@@ -90,8 +95,8 @@ RS232, RS485 and Powerline.
 | [`smadata1::powerline`](../src/crates/smalog-connection/src/smadata1/powerline.rs) | `PowerlineConnection` — stable Sunny-Net/Powerline boundary; framing and adapter I/O are explicitly unsupported. |
 | [`collector`](../src/crates/smalog-connection/src/collector.rs) | One `Collector` that drives any `Connection` through the SBFspot-inspired poll sequence. |
 
-**Connection trait.** All transports implement one trait, so the collector is
-transport-agnostic:
+**Connection trait.** All current and planned transports implement the same
+low-level session trait, so the collector is transport-agnostic:
 
 ```
 begin() → login_all() → set_clock(Auto) → request_all(cmd,first,last,…)×N → end()
@@ -124,7 +129,8 @@ Its interface accepts only `smalog-observation` values; it has no dependency on
 `smalog-sbfspot-migrator` owns legacy-schema inspection, mapping, resumable
 batch orchestration, and verification. It depends on `smalog-storage` so
 imported rows and rebuilt statistics use the same canonical rules as live
-writes. Neither library crate depends on the `smalog` application.
+writes, and uses connection LRI constants when interpreting legacy rows.
+Neither library crate depends on the `smalog` application.
 
 `smalog-schema-benchmark` owns deterministic fixture generation, capacity
 loading, query-plan measurement and checksum verification. It depends only
@@ -137,6 +143,18 @@ neutral `PollCycleObservation` values and has no dependency on the connection,
 persistence or service crates. Localized labels come from the independent
 `smalog-tags` crate. Webbox CSV, 123Solar and PVOutput are recorded as planned
 capabilities instead of being exposed as non-functional adapters.
+
+## The `smalog-observation` and `smalog-tags` crates
+
+| Module | Responsibility |
+|---|---|
+| [`smalog-observation::model`](../src/crates/smalog-observation/src/model.rs) | Strong unit types, UTF-8 `CanonicalText`, inverter identity and canonical measurements. |
+| [`smalog-observation::observation`](../src/crates/smalog-observation/src/observation.rs) | Poll Cycle, per-inverter live/archive outcomes, failures and untranslated event values. |
+| [`smalog-tags`](../src/crates/smalog-tags/src/lib.rs) | Locale selection and lazy lookup of embedded structured UTF-8 tag catalogs. |
+
+`smalog-observation` carries tag identifiers rather than translated text.
+Presentation layers resolve those identifiers through `smalog-tags`, keeping
+locale state out of persistence and connection results.
 
 ## The `smalog` app
 
@@ -168,6 +186,7 @@ to storage, CSV, MQTT and runtime status. Protocol snapshots stay inside
 | [`metrics`](../src/crates/smalog-export/src/metrics.rs) | MQTT topic, scaling and metadata registry. |
 | [`config`](../src/crates/smalog-export/src/config.rs) | CSV/MQTT configuration types and defaults embedded by the app configuration. |
 | [`planned`](../src/crates/smalog-export/src/planned.rs) | Capability catalog for Webbox CSV, 123Solar and PVOutput. |
+| [`view`](../src/crates/smalog-export/src/view.rs) | Private compatibility projection from canonical observations into the SBFspot-shaped CSV/MQTT renderers. |
 
 ## HTTP API + UI
 

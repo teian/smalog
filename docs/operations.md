@@ -236,6 +236,13 @@ canonical `inverter_daily_yields`/`inverter_energy_samples`, and
 into `inverter_events`. Set `event_months = 0` to skip
 events.
 
+Daily collection is currently tracked by a process-local date. If any
+collector fails, smalog retries the daily request on the next poll; after a
+restart it requests the archives again. Database write failures are logged
+but do not currently retain a durable per-inverter completion marker. The
+target completion semantics are documented in the
+[domain glossary](../CONTEXT.md#daily-archive-completion).
+
 Every cycle also writes spot data, updates live inverter status, and
 publishes [MQTT](mqtt.md) (if enabled).
 

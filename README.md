@@ -160,7 +160,7 @@ sudo install -m 0755 target/release/smalog /usr/bin/smalog
 ```
 
 A backend-only binary needs no JavaScript toolchain. To embed the dashboard,
-also install Node.js `22`, enable the pinned pnpm version, build the UI, and
+also install Node.js `24`, enable the pinned pnpm version, build the UI, and
 enable the Rust `ui` feature:
 
 ```bash

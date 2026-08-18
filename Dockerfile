@@ -12,7 +12,7 @@
 # --- Web UI: build the static dashboard to embed into the binary --------
 # The UI output is architecture-independent. Building this stage on the
 # BuildKit host also enables linux/386 images, for which Node has no image.
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS ui
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS ui
 WORKDIR /ui
 RUN corepack enable && corepack prepare pnpm@11.1.1 --activate
 COPY src/ui/package.json src/ui/pnpm-lock.yaml src/ui/pnpm-workspace.yaml ./

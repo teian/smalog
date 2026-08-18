@@ -1,0 +1,6 @@
+smalog (0.1.0-1) unstable; urgency=medium
+
+  * Initial Debian package for armhf and arm64.
+    Release notes: https://github.com/teian/smalog/releases
+
+ -- Frank Gehann <fg@fgehann.de>  Tue, 18 Aug 2026 13:00:00 +0000

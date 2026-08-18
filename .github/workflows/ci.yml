@@ -134,10 +134,14 @@ jobs:
             release_arch: linux-x86
           - target: x86_64-unknown-linux-gnu
             release_arch: linux-amd64
+          # Debian packages target the Raspberry Pi, so only these two build
+          # one. Adding another is a matter of setting deb_arch.
           - target: armv7-unknown-linux-gnueabihf
             release_arch: linux-armv7
+            deb_arch: armhf
           - target: aarch64-unknown-linux-gnu
             release_arch: linux-arm64
+            deb_arch: arm64
     steps:
       - name: Validate release tag
         env:
@@ -169,6 +173,10 @@ jobs:
           --rev 1d07d3f9cc465c435256f1aabc1d18024517891a
           --locked
 
+      - name: Install cargo-deb
+        if: matrix.deb_arch != ''
+        run: cargo install cargo-deb --version 3.7.0 --locked
+
       - name: Build release binary
         run: >-
           cross build
@@ -193,11 +201,42 @@ jobs:
           tar -C package -czf \
             "release/smalog-${RELEASE_TAG}-${RELEASE_ARCH}.tar.gz" .
 
+      - name: Write Debian changelog for this release
+        if: matrix.deb_arch != ''
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Rewritten per release so the packaged changelog names the version
+          # being built rather than whatever was committed.
+          version="${RELEASE_TAG#v}"
+          {
+            printf 'smalog (%s-1) unstable; urgency=medium\n\n' "$version"
+            printf '  * Release %s.\n' "$RELEASE_TAG"
+            printf '    https://github.com/%s/releases/tag/%s\n\n' \
+              "$GITHUB_REPOSITORY" "$RELEASE_TAG"
+            printf ' -- %s  %s\n' \
+              "Frank Gehann <fg@fgehann.de>" "$(date -uR)"
+          } > packaging/changelog.Debian
+
+      - name: Build Debian package
+        if: matrix.deb_arch != ''
+        env:
+          TARGET: ${{ matrix.target }}
+        run: >-
+          cargo deb
+          --no-build
+          --no-strip
+          --target "$TARGET"
+          --package smalog
+          --output release/
+
       - name: Upload release archive
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.release_arch }}
-          path: release/*.tar.gz
+          path: |
+            release/*.tar.gz
+            release/*.deb
           retention-days: 1
 
   release-image:
@@ -273,7 +312,7 @@ jobs:
 
       - name: Create checksums
         working-directory: release
-        run: sha256sum smalog-*.tar.gz > SHA256SUMS
+        run: sha256sum smalog-*.tar.gz smalog_*.deb > SHA256SUMS
 
       - name: Upload release assets
         env:
@@ -283,6 +322,7 @@ jobs:
         run: |
           gh release upload "$RELEASE_TAG" \
             release/smalog-*.tar.gz \
+            release/smalog_*.deb \
             release/SHA256SUMS \
             --clobber
 

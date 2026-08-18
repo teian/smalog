@@ -435,6 +435,55 @@ automatically generated notes about the changes since the previous release.
 Stable releases additionally update both `latest` image tags. Any manually
 entered description is retained.
 
+## Development
+
+Run the service and the dashboard directly from a source checkout — no
+installation, no systemd. Install the build prerequisites from
+[Option B: build from source](#option-b-build-from-source) first.
+
+### Backend
+
+Create a local configuration next to the checkout; `config.toml` is
+gitignored:
+
+```bash
+cp config.example.toml config.toml
+$EDITOR config.toml
+```
+
+For development, point the database at a workspace-local file, for
+example `url = "sqlite://data/smalog.db"`, and keep
+`listen = "0.0.0.0:8080"`. Export every `${VAR}` the file references,
+then run a debug build:
+
+```bash
+export SMALOG_INV1_PASSWORD='0000'
+
+cargo run -p smalog -- --config config.toml run
+```
+
+`--config` is required because the default path is
+`/etc/smalog/config.toml`. During iteration, `once` performs a single
+poll cycle and exits, and `check-config` validates configuration edits
+(see [CLI](#cli)).
+
+### Web dashboard
+
+The Vite dev server serves the UI with hot reload and proxies `/api` to
+the locally running backend on port `8080`, so the Rust `ui` feature is
+not needed during development:
+
+```bash
+cd src/ui
+corepack enable
+pnpm install
+pnpm run dev      # http://localhost:5173
+```
+
+To point the dev server at a remote smalog instance instead, set
+`VITE_API_BASE` (see `src/ui/.env.example`). More detail in
+[Web UI & API](docs/ui.md).
+
 ## CLI
 
 | Command | Purpose |

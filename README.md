@@ -92,7 +92,36 @@ Raspberry Pi hosts) or Docker. Both variants use the same `config.toml`.
 
 ### 2. Install a native binary
 
-#### Option A: use a release archive
+#### Option A: Debian package (Raspberry Pi)
+
+For Raspberry Pi OS and Debian on ARM, a `.deb` does the integration work —
+system user, state directory, systemd unit — in one step. Download the package
+for your architecture and `SHA256SUMS` from
+[GitHub Releases](https://github.com/teian/smalog/releases): `arm64` for a
+64-bit OS (Pi 3/4/5), `armhf` for a 32-bit one (Pi 2/3/4).
+
+```bash
+# Check `dpkg --print-architecture` if you are unsure which one you need.
+sha256sum --check SHA256SUMS --ignore-missing
+sudo apt install ./smalog_X.Y.Z-1_arm64.deb
+```
+
+The package installs `/usr/bin/smalog` and the systemd unit but **does not
+start the service** — it has no configuration yet, and starting it would only
+produce a failure every 30 seconds. Two steps remain:
+
+```bash
+sudo cp /etc/smalog/config.example.toml /etc/smalog/config.toml
+sudo $EDITOR /etc/smalog/config.toml          # inverters, database, secrets
+sudo smalog --config /etc/smalog/config.toml check-config
+sudo systemctl enable --now smalog
+```
+
+Your `/etc/smalog/config.toml` is a file the package never declares, so no
+upgrade or removal can overwrite, prompt about or delete it. Continue at
+[section 4](#4-configure-the-service); sections 2 and 3 are already done.
+
+#### Option B: use a release archive
 
 Download the archive for your platform and `SHA256SUMS` from
 [GitHub Releases](https://github.com/teian/smalog/releases). Available
@@ -102,13 +131,18 @@ builds target Linux x86, amd64, ARMv7 and ARM64.
 # Replace the file name with the archive you downloaded.
 sha256sum --check SHA256SUMS --ignore-missing
 tar -xzf smalog-vX.Y.Z-linux-amd64.tar.gz
-sudo install -m 0755 smalog /usr/local/bin/smalog
+sudo install -m 0755 smalog /usr/bin/smalog
 smalog --version
 ```
 
 Release binaries include the embedded web dashboard.
 
-#### Option B: build from source
+> **Upgrading from a release before the Debian packages?** The bundled
+> `smalog.service` now runs `/usr/bin/smalog`, not `/usr/local/bin/smalog`.
+> Either move the binary, or edit `ExecStart=` in your copy of the unit —
+> otherwise the service fails to start with "No such file or directory".
+
+#### Option C: build from source
 
 The service requires Rust `1.85` or newer. The CI and container builds use
 Rust `1.93`. On Debian or Ubuntu, install the native build tools and Rust:
@@ -122,7 +156,7 @@ source "$HOME/.cargo/env"
 git clone https://github.com/teian/smalog.git
 cd smalog
 cargo build --release --locked -p smalog
-sudo install -m 0755 target/release/smalog /usr/local/bin/smalog
+sudo install -m 0755 target/release/smalog /usr/bin/smalog
 ```
 
 A backend-only binary needs no JavaScript toolchain. To embed the dashboard,
@@ -137,10 +171,13 @@ pnpm install --frozen-lockfile
 pnpm run build
 cd ../..
 cargo build --release --locked -p smalog --features ui
-sudo install -m 0755 target/release/smalog /usr/local/bin/smalog
+sudo install -m 0755 target/release/smalog /usr/bin/smalog
 ```
 
 ### 3. Create the configuration and state directories
+
+Skip this section if you installed the Debian package: it already created the
+`smalog` user and `/var/lib/smalog`, and placed the example configuration.
 
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin smalog
@@ -275,6 +312,12 @@ The second command requests every applicable spot-data group and can take
 several minutes on older devices whose unsupported registers time out.
 
 ### 6. Install and start the systemd service
+
+The Debian package already installed the unit at
+`/lib/systemd/system/smalog.service`; go straight to `systemctl enable --now
+smalog`. Do **not** also copy a unit into `/etc/systemd/system/` — a file
+there overrides the packaged one and will keep pointing at whatever path it
+names, including after an upgrade moves the binary.
 
 From a source checkout:
 
@@ -443,7 +486,7 @@ entered description is retained.
 
 Run the service and the dashboard directly from a source checkout — no
 installation, no systemd. Install the build prerequisites from
-[Option B: build from source](#option-b-build-from-source) first.
+[Option C: build from source](#option-c-build-from-source) first.
 
 ### Backend
 

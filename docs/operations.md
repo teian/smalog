@@ -108,6 +108,47 @@ Reads `service.listen` from the config and makes a `GET /healthz` request
 `0.0.0.0`). Exits `0` on HTTP 200. Requires `service.listen` to be
 configured.
 
+## Installing from the Debian package
+
+Releases publish a `.deb` for `armhf` and `arm64` — the two Raspberry Pi
+architectures — beside the tar.gz archives, covered by the same `SHA256SUMS`.
+
+```bash
+sudo apt install ./smalog_X.Y.Z-1_arm64.deb
+```
+
+What the package does, and deliberately does not do:
+
+| Step | Install | Upgrade | Remove | Purge |
+|---|---|---|---|---|
+| `/usr/bin/smalog`, unit, `config.example.toml` | installed | replaced | removed | removed |
+| `smalog` system user, `/var/lib/smalog` | created | kept | kept | removed |
+| `/etc/smalog/config.toml`, `smalog.env` | never touched | never touched | never touched | never touched |
+| The service | **not started** | restarted if you enabled it | stopped | stopped |
+
+The package does not start the service. Without `/etc/smalog/config.toml` the
+first start would fail, and `Restart=on-failure` with `RestartSec=30` would
+repeat that failure every half minute. Write the configuration, then:
+
+```bash
+sudo smalog --config /etc/smalog/config.toml check-config
+sudo systemctl enable --now smalog
+```
+
+Two things worth knowing:
+
+- **A unit in `/etc/systemd/system/` wins over the packaged one.** If you
+  previously installed by hand and copied `smalog.service` there, systemd keeps
+  using your copy — including its old `ExecStart`. Remove it, or update it.
+- **`ExecStart` is `/usr/bin/smalog`.** Releases before the packages used
+  `/usr/local/bin/smalog`, which Debian policy reserves for the local
+  administrator and forbids a package from writing. A hand-built install that
+  kept the binary there needs one of the two paths adjusted.
+
+Purging removes what the package created and nothing else. A database you
+configured outside `/var/lib/smalog` is not found or deleted by it — and
+neither is your configuration.
+
 ## Running under systemd
 
 A ready-to-use unit lives at

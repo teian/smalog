@@ -1,0 +1,39 @@
+#!/bin/sh
+# On removal keep everything: a removed package may be reinstalled, and the
+# collected production history is not ours to delete.
+#
+# On purge remove what the package created -- the state directory and the
+# system user -- and nothing else. The operator's /etc/smalog/config.toml and
+# secrets file were never ours, and a database configured to live elsewhere is
+# not ours to find or delete either.
+set -e
+
+SMALOG_USER=smalog
+SMALOG_STATE=/var/lib/smalog
+
+case "$1" in
+    purge)
+        rm -rf "$SMALOG_STATE"
+        if getent passwd "$SMALOG_USER" >/dev/null; then
+            deluser --system "$SMALOG_USER" >/dev/null || true
+        fi
+        if getent group "$SMALOG_USER" >/dev/null; then
+            delgroup --system "$SMALOG_USER" >/dev/null || true
+        fi
+        # /etc/smalog itself only goes when it is empty, so an operator's
+        # config.toml or smalog.env keeps it.
+        rmdir /etc/smalog 2>/dev/null || true
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -2,7 +2,7 @@
 name = "smalog"
 version = "0.1.0"
 edition = "2021"
-description = "smalog — SMA inverter logger"
+description = "SMA inverter logger with storage, MQTT and a web dashboard"
 license = "EUPL-1.2"
 repository = "https://github.com/teian/smalog"
 rust-version = "1.85"
@@ -40,3 +40,54 @@ chrono-tz = "0.10.4"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres", "chrono", "migrate", "macros"] }
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+
+# Debian packages for Raspberry Pi hosts (armhf, arm64). Built by the release
+# job from the binary `cross` already produced:
+#   cargo deb --no-build --target <triple> --package smalog
+#
+# Name, version, licence and homepage come from [package] above, so a version
+# bump cannot leave the package describing the previous release.
+[package.metadata.deb]
+maintainer = "Frank Gehann <fg@fgehann.de>"
+section = "net"
+priority = "optional"
+# Written out rather than `$auto`: the release runner is x86-64 and cannot
+# inspect an ARM binary's linkage.
+#
+# Verified with `objdump -p` on both ARM binaries: libc.so.6, libm.so.6 and
+# the loader come from libc6, libgcc_s.so.1 from libgcc-s1. The floor is the
+# highest glibc symbol version either binary references, so apt refuses the
+# install on a too-old release instead of letting the service die on a missing
+# symbol. 2.34 needs Debian bookworm or newer; bullseye ships 2.31.
+# adduser is a separate package since bookworm and is called by postinst,
+# so it cannot be assumed present (lintian:
+# maintainer-script-needs-depends-on-adduser).
+depends = "libc6 (>= 2.34), libgcc-s1, adduser"
+extended-description = """\
+smalog reads power production from SMA solar inverters over Speedwire/Ethernet \
+or Bluetooth, stores it in SQLite or PostgreSQL, and publishes MQTT, all in one \
+long-running service. It ships an optional web dashboard and an HTTP API.
+
+The package installs the binary and a systemd unit but does not start the \
+service: it needs /etc/smalog/config.toml naming your inverters first."""
+license-file = ["../../../LICENSE.md", "0"]
+assets = [
+    ["target/release/smalog", "usr/bin/", "755"],
+    ["../../../config.example.toml", "etc/smalog/config.example.toml", "644"],
+    ["../../../README.md", "usr/share/doc/smalog/README.md", "644"],
+]
+# Only the example is ours. /etc/smalog/config.toml is written by the operator
+# and never declared here, so no upgrade or purge can touch, prompt about or
+# delete it.
+conf-files = ["/etc/smalog/config.example.toml"]
+maintainer-scripts = "../../../packaging"
+changelog = "../../../packaging/changelog.Debian"
+
+# Register the unit and restart it on upgrade if the operator enabled it, but
+# never enable or start it: without a configuration the first start would fail,
+# and Restart=on-failure would repeat that failure every 30 s.
+[package.metadata.deb.systemd-units]
+unit-scripts = "../../../packaging"
+enable = false
+start = false
+restart-after-upgrade = true

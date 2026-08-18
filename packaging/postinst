@@ -1,0 +1,62 @@
+#!/bin/sh
+# Prepare the system for the unit: the service runs as its own user and keeps
+# its database under /var/lib/smalog. Both must exist before anyone starts it.
+#
+# Every step is idempotent: this script also runs on reinstall and on upgrade,
+# where the user and the directory already exist and must be left as they are.
+set -e
+
+SMALOG_USER=smalog
+SMALOG_STATE=/var/lib/smalog
+
+case "$1" in
+    configure)
+        if ! getent group "$SMALOG_USER" >/dev/null; then
+            addgroup --system "$SMALOG_USER"
+        fi
+        # Before adduser, so it does not warn about a home directory that does
+        # not exist yet. Owned by the service and readable by nobody else: the
+        # database may hold a plant's full production history.
+        if [ ! -d "$SMALOG_STATE" ]; then
+            mkdir -p "$SMALOG_STATE"
+            chmod 0750 "$SMALOG_STATE"
+        fi
+
+        if ! getent passwd "$SMALOG_USER" >/dev/null; then
+            adduser --system \
+                --ingroup "$SMALOG_USER" \
+                --home "$SMALOG_STATE" \
+                --no-create-home \
+                --gecos "smalog SMA inverter logger" \
+                --shell /usr/sbin/nologin \
+                "$SMALOG_USER"
+        fi
+        chown "$SMALOG_USER:$SMALOG_USER" "$SMALOG_STATE"
+
+        # /etc/smalog/config.toml is deliberately not created here: it names
+        # inverters, addresses and passwords, so it is the operator's file and
+        # dpkg never learns about it.
+        if [ -z "$2" ] && [ ! -e /etc/smalog/config.toml ]; then
+            echo ""
+            echo "smalog is installed but not started -- it needs a configuration first:"
+            echo ""
+            echo "  1. cp /etc/smalog/config.example.toml /etc/smalog/config.toml"
+            echo "     and edit it (see /usr/share/doc/smalog/README.md)"
+            echo "  2. smalog --config /etc/smalog/config.toml check-config"
+            echo "  3. systemctl enable --now smalog"
+            echo ""
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

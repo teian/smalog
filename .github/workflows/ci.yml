@@ -160,6 +160,33 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
 
+      - name: Verify the tag matches the crate version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # The package version comes from Cargo.toml, the release name from
+          # the tag. Nothing else keeps them in step, and a mismatch ships a
+          # .deb whose version disagrees with the release it belongs to.
+          crate_version="$(
+            cargo metadata --format-version 1 --no-deps \
+              | jq -r '.packages[] | select(.name == "smalog") | .version'
+          )"
+          # A prerelease suffix may differ: v1.2.3-rc.1 releases crate 1.2.3.
+          if [[ "${RELEASE_TAG#v}" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            tag_version="${BASH_REMATCH[1]}"
+          else
+            echo "Cannot read a version out of tag $RELEASE_TAG." >&2
+            exit 1
+          fi
+          if [[ "$tag_version" != "$crate_version" ]]; then
+            echo "Tag $RELEASE_TAG implies version $tag_version, but the smalog" >&2
+            echo "crate is $crate_version. Bump src/crates/smalog/Cargo.toml or" >&2
+            echo "retag: otherwise the package would be $crate_version-1 inside" >&2
+            echo "a $tag_version release." >&2
+            exit 1
+          fi
+          echo "Tag $RELEASE_TAG matches crate version $crate_version."
+
       - name: Download UI
         uses: actions/download-artifact@v8
         with:
@@ -208,7 +235,15 @@ jobs:
         run: |
           # Rewritten per release so the packaged changelog names the version
           # being built rather than whatever was committed.
-          version="${RELEASE_TAG#v}"
+          #
+          # The version is the crate's, not the tag's: cargo-deb takes the
+          # package version from Cargo.toml, and a changelog naming anything
+          # else would contradict the package shipping it. A prerelease tag
+          # such as v1.2.3-rc.1 is named in the entry text instead.
+          version="$(
+            cargo metadata --format-version 1 --no-deps \
+              | jq -r '.packages[] | select(.name == "smalog") | .version'
+          )"
           {
             printf 'smalog (%s-1) unstable; urgency=medium\n\n' "$version"
             printf '  * Release %s.\n' "$RELEASE_TAG"

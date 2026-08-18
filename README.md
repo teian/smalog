@@ -137,7 +137,7 @@ smalog --version
 
 Release binaries include the embedded web dashboard.
 
-> **Upgrading from a release before the Debian packages?** The bundled
+> **Installed by hand before the Debian packages existed?** The bundled
 > `smalog.service` now runs `/usr/bin/smalog`, not `/usr/local/bin/smalog`.
 > Either move the binary, or edit `ExecStart=` in your copy of the unit —
 > otherwise the service fails to start with "No such file or directory".

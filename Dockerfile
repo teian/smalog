@@ -61,9 +61,17 @@ RUN mkdir -p src/crates/smalog/src \
         src/crates/smalog-storage/src \
         src/crates/smalog-tags/src \
         src/crates/smalog-sbfspot-migrator/src \
-        src/crates/smalog-schema-benchmark/src
+        src/crates/smalog-schema-benchmark/src \
+    && rm -rf target/release/.fingerprint/smalog-* \
+        target/release/deps/*smalog*
 
 # Real sources + the built UI, then compile with it embedded.
+#
+# The stub artifacts above are deleted rather than left for cargo to
+# invalidate: cargo decides freshness by mtime, and COPY gives these files the
+# checkout's timestamps, which are older than the stub build inside the image.
+# Cargo would call the workspace crates fresh and keep linking the empty stub
+# libraries, so every import from them fails to resolve.
 COPY src ./src
 COPY --from=ui /ui/dist ./src/ui/dist
 RUN cargo build --release --locked -p smalog --features ui

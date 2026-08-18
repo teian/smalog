@@ -17,11 +17,13 @@ import {
   DiagnosticsView,
   type DiagnosticSection,
 } from "@/components/DiagnosticsView";
+import { SystemView, type SystemTab } from "@/components/SystemView";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { type Language, useI18n } from "@/lib/i18n";
 
 const RANGES: Range[] = ["day", "week", "month", "year"];
+const SYSTEM_TABS: SystemTab[] = ["transmissions", "log"];
 
 export default function App() {
   const { language, setLanguage, t } = useI18n();
@@ -30,6 +32,8 @@ export default function App() {
   const [range, setRange] = useState<Range>("day");
   const [serial, setSerial] = useState<number | null>(null); // null = aggregate
   const [section, setSection] = useState<DashboardSection>("energy");
+  // Kept in App so the choice survives leaving and re-entering the area.
+  const [systemTab, setSystemTab] = useState<SystemTab>("transmissions");
   const [refreshKey, setRefreshKey] = useState(0);
 
   // Poll live status every 30 s.
@@ -70,7 +74,9 @@ export default function App() {
         ? "events"
         : section === "device"
           ? "deviceStatistics"
-          : "gridQuality",
+          : section === "grid"
+            ? "gridQuality"
+            : "system",
   );
 
   return (
@@ -155,6 +161,23 @@ export default function App() {
                   </TabsList>
                 </Tabs>
               )}
+              {section === "system" && (
+                <Tabs
+                  value={systemTab}
+                  onValueChange={(value) => setSystemTab(value as SystemTab)}
+                >
+                  <TabsList
+                    aria-label={t("systemTabs")}
+                    className="grid w-full grid-cols-2 sm:w-auto"
+                  >
+                    {SYSTEM_TABS.map((tab) => (
+                      <TabsTrigger key={tab} value={tab}>
+                        {t(tab === "transmissions" ? "transmissions" : "applicationLog")}
+                      </TabsTrigger>
+                    ))}
+                  </TabsList>
+                </Tabs>
+              )}
             </CardHeader>
             <CardContent className="min-w-0">
               {section === "energy" ? (
@@ -163,6 +186,8 @@ export default function App() {
                   serial={serial}
                   inverterName={heading}
                 />
+              ) : section === "system" ? (
+                <SystemView tab={systemTab} serial={serial} />
               ) : (
                 <DiagnosticsView
                   serial={serial}

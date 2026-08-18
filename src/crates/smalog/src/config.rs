@@ -98,6 +98,25 @@ pub struct ServiceConfig {
     /// "LRI not available". Only useful with an SMA consumption meter.
     #[serde(default)]
     pub poll_consumption: bool,
+    /// How long recorded Poll Cycle transmissions are kept, in hours.
+    /// `0` disables recording; stored rows are left untouched.
+    #[serde(default = "default_diagnostics_retention_hours")]
+    pub transmission_log_retention_hours: u32,
+    /// How long captured application log records are kept, in hours.
+    /// `0` disables capture. The log lives in process memory only, so this
+    /// window is lost on restart by design.
+    #[serde(default = "default_diagnostics_retention_hours")]
+    pub application_log_retention_hours: u32,
+    /// Row cap for the transmission ring. Bounds the table when the poll
+    /// interval or collector count makes the retention window larger than
+    /// expected; the retention window is the primary bound.
+    #[serde(default = "default_diagnostics_max_entries")]
+    pub transmission_log_max_entries: u32,
+    /// Record cap for the in-memory application log ring, and therefore its
+    /// memory ceiling. Mostly matters at a verbose `[log] level`, where the
+    /// window alone would not bound it.
+    #[serde(default = "default_diagnostics_max_entries")]
+    pub application_log_max_entries: u32,
 }
 
 impl Default for ServiceConfig {
@@ -109,8 +128,24 @@ impl Default for ServiceConfig {
             poll_at_night: false,
             calc_missing_spot: false,
             poll_consumption: false,
+            transmission_log_retention_hours: default_diagnostics_retention_hours(),
+            application_log_retention_hours: default_diagnostics_retention_hours(),
+            transmission_log_max_entries: default_diagnostics_max_entries(),
+            application_log_max_entries: default_diagnostics_max_entries(),
         }
     }
+}
+
+/// Two days: long enough to look back across a night, a weekend or an
+/// intermittent fault without leaving the dashboard.
+fn default_diagnostics_retention_hours() -> u32 {
+    48
+}
+
+/// Bounds the transmission table near 13 MB including indexes on SQLite, and
+/// the in-memory log ring near 12 MB.
+fn default_diagnostics_max_entries() -> u32 {
+    50_000
 }
 
 fn default_interval() -> u64 {
@@ -345,6 +380,36 @@ impl Config {
         }
         if !(1..=86400).contains(&self.service.interval) {
             return Err(Error::Config("service.interval out of range".into()));
+        }
+        for (key, hours) in [
+            (
+                "service.transmission_log_retention_hours",
+                self.service.transmission_log_retention_hours,
+            ),
+            (
+                "service.application_log_retention_hours",
+                self.service.application_log_retention_hours,
+            ),
+        ] {
+            if hours > 8760 {
+                return Err(Error::Config(format!("{key} > 8760 (one year)")));
+            }
+        }
+        // Zero is not a second, silent way to disable recording: that is what
+        // the retention keys are for.
+        for (key, entries) in [
+            (
+                "service.transmission_log_max_entries",
+                self.service.transmission_log_max_entries,
+            ),
+            (
+                "service.application_log_max_entries",
+                self.service.application_log_max_entries,
+            ),
+        ] {
+            if !(1..=1_000_000).contains(&entries) {
+                return Err(Error::Config(format!("{key} out of range (1..=1000000)")));
+            }
         }
         if self.plant.latitude.abs() > 90.0 || self.plant.longitude.abs() > 180.0 {
             return Err(Error::Config(

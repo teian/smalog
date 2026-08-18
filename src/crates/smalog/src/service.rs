@@ -20,8 +20,10 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use crate::applog::{LogBuffer, LogLevel, LogQuery};
 use crate::config::{Config, InverterCommunication, InverterConfig};
 use crate::daylight;
+use crate::diagnostics::{CollectorSink, DiagnosticsWriter, RingBounds, Shutdown, WriteQueue};
 use crate::error::Result;
 use crate::storage::Db;
 use smalog_connection::{
@@ -33,6 +35,7 @@ use smalog_observation::{
     ArchiveOutcome, CanonicalText, EventValue, InverterDailyYield, InverterEnergySample,
     InverterEvent, InverterPollObservation, PollCycleObservation, UnixSeconds, WattHours, Watts,
 };
+use smalog_storage::diagnostics as storage_diagnostics;
 use smalog_tags as tags;
 
 #[derive(Default)]
@@ -60,6 +63,9 @@ pub struct Service {
     mqtt: Option<MqttPublisher>,
     status: Arc<RwLock<Status>>,
     last_daily: Option<chrono::NaiveDate>,
+    diagnostics: Arc<WriteQueue>,
+    transmission_ring: RingBounds,
+    log_buffer: Arc<LogBuffer>,
 }
 
 struct ConfiguredCollector {
@@ -68,7 +74,11 @@ struct ConfiguredCollector {
 }
 
 impl Service {
-    pub async fn new(config: Config) -> Result<Service> {
+    pub async fn new(
+        config: Config,
+        diagnostics: Arc<WriteQueue>,
+        log_buffer: Arc<LogBuffer>,
+    ) -> Result<Service> {
         let tz = config.timezone()?;
         // Select the tag-text language (event descriptions, CSV headers).
         // validate() has already confirmed the locale parses.
@@ -81,7 +91,23 @@ impl Service {
         } else {
             Db::connect(&config.database.url, tz).await?
         });
-        let collectors = Self::build_collectors(&config, tz).await?;
+        let transmission_ring = RingBounds::new(
+            config.service.transmission_log_retention_hours,
+            config.service.transmission_log_max_entries,
+        );
+        // Create the optional diagnostics tables only when transmissions are
+        // recorded into them. Disabling later never drops them: that would
+        // delete the history an operator disabled recording to preserve.
+        // The application log needs no table at all.
+        if transmission_ring.enabled() {
+            db.enable_diagnostics().await?;
+        }
+        let collectors = Self::build_collectors(
+            &config,
+            tz,
+            transmission_ring.enabled().then(|| diagnostics.clone()),
+        )
+        .await?;
         let mqtt = if config.mqtt.enabled {
             Some(MqttPublisher::start(
                 &config.mqtt,
@@ -100,12 +126,19 @@ impl Service {
             mqtt,
             status: Arc::new(RwLock::new(Status::default())),
             last_daily: None,
+            diagnostics,
+            transmission_ring,
+            log_buffer,
         })
     }
 
     /// Build one shared Ethernet collector plus one collector for every
     /// configured Bluetooth inverter.
-    async fn build_collectors(config: &Config, tz: Tz) -> Result<Vec<ConfiguredCollector>> {
+    async fn build_collectors(
+        config: &Config,
+        tz: Tz,
+        diagnostics: Option<Arc<WriteQueue>>,
+    ) -> Result<Vec<ConfiguredCollector>> {
         let options = PollOptions {
             calc_missing_spot: config.service.calc_missing_spot,
             poll_consumption: config.service.poll_consumption,
@@ -137,10 +170,16 @@ impl Service {
                 .join(", ");
             let connector: Box<dyn Connection> =
                 Box::new(SpeedwireConnection::connect(ethernet_specs).await?);
-            collectors.push(ConfiguredCollector {
-                target,
-                collector: Collector::new(connector, tz, options),
-            });
+            let collector = match &diagnostics {
+                Some(queue) => Collector::with_sink(
+                    connector,
+                    tz,
+                    options,
+                    CollectorSink::new(queue.clone(), &target),
+                ),
+                None => Collector::new(connector, tz, options),
+            };
+            collectors.push(ConfiguredCollector { target, collector });
         }
         for inverter in config
             .inverters
@@ -149,10 +188,17 @@ impl Service {
         {
             let bluetooth: BluetoothConnection =
                 BluetoothConnection::new(inverter.to_bluetooth_params(tz)?);
-            collectors.push(ConfiguredCollector {
-                target: inverter_target(inverter),
-                collector: Collector::new(Box::new(bluetooth), tz, options),
-            });
+            let target = inverter_target(inverter);
+            let collector = match &diagnostics {
+                Some(queue) => Collector::with_sink(
+                    Box::new(bluetooth),
+                    tz,
+                    options,
+                    CollectorSink::new(queue.clone(), &target),
+                ),
+                None => Collector::new(Box::new(bluetooth), tz, options),
+            };
+            collectors.push(ConfiguredCollector { target, collector });
         }
         Ok(collectors)
     }
@@ -190,12 +236,30 @@ impl Service {
 
     /// Main loop: run until SIGINT/SIGTERM.
     pub async fn run(mut self) -> Result<()> {
+        // The writer owns every database round trip for diagnostics, so a
+        // slow or failing database can never reach the poll loop below.
+        let shutdown = Shutdown::new();
+        let writer = self.transmission_ring.enabled().then(|| {
+            let writer = DiagnosticsWriter::new(
+                self.diagnostics.clone(),
+                self.db.clone(),
+                self.transmission_ring,
+            );
+            let shutdown = shutdown.clone();
+            tokio::spawn(writer.run(shutdown))
+        });
+
         if let Some(addr) = self.config.service.listen {
-            let status = self.status.clone();
-            let db = self.db.clone();
-            let tz = self.tz;
+            let state = ApiState {
+                status: self.status.clone(),
+                db: self.db.clone(),
+                tz: self.tz,
+                diagnostics: self.diagnostics.clone(),
+                transmission_ring: self.transmission_ring,
+                log_buffer: self.log_buffer.clone(),
+            };
             tokio::spawn(async move {
-                if let Err(e) = serve_http(addr, status, db, tz).await {
+                if let Err(e) = serve_http(addr, state).await {
                     error!(error = %e, "http server failed");
                 }
             });
@@ -219,6 +283,17 @@ impl Service {
                 _ = sigterm.recv() => { info!("SIGTERM, shutting down"); break; }
             }
             self.tick().await;
+        }
+        // Give the writer a bounded chance to persist what is still queued —
+        // the records right before a restart are the ones worth having.
+        if let Some(writer) = writer {
+            shutdown.trigger();
+            if tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .is_err()
+            {
+                warn!("diagnostics writer did not finish flushing within 5 s");
+            }
         }
         Ok(())
     }
@@ -299,6 +374,23 @@ impl Service {
         }
         let error = (!errors.is_empty()).then(|| errors.join("; "));
         self.update_status(&status_cycle, error).await;
+    }
+
+    /// One cycle for `smalog once`: poll, then persist the diagnostics that
+    /// cycle produced. Without the flush the queued entries would be dropped
+    /// when the process exits, which is the opposite of what a one-shot
+    /// diagnostic run is for.
+    pub async fn tick_once(&mut self) {
+        self.tick().await;
+        if self.transmission_ring.enabled() {
+            DiagnosticsWriter::new(
+                self.diagnostics.clone(),
+                self.db.clone(),
+                self.transmission_ring,
+            )
+            .flush()
+            .await;
+        }
     }
 
     async fn export(&mut self, cycle: &PollCycleObservation) {
@@ -519,6 +611,24 @@ struct ApiState {
     status: Arc<RwLock<Status>>,
     db: Arc<Db>,
     tz: Tz,
+    diagnostics: Arc<WriteQueue>,
+    transmission_ring: RingBounds,
+    log_buffer: Arc<LogBuffer>,
+}
+
+impl ApiState {
+    /// State for a handler test: both rings enabled with their defaults.
+    #[cfg(test)]
+    fn for_tests(db: Arc<Db>, tz: Tz) -> ApiState {
+        ApiState {
+            status: Arc::new(RwLock::new(Status::default())),
+            db,
+            tz,
+            diagnostics: WriteQueue::new(crate::diagnostics::QUEUE_CAPACITY),
+            transmission_ring: RingBounds::new(48, 50_000),
+            log_buffer: LogBuffer::new(48, 50_000),
+        }
+    }
 }
 
 /// Query parameters for `GET /api/history`.
@@ -601,13 +711,7 @@ fn log_http_endpoints(addr: std::net::SocketAddr) {
 
 /// The HTTP server (axum): health, live status, history and inverter list;
 /// plus the embedded dashboard as a fallback when built `--features ui`.
-async fn serve_http(
-    addr: std::net::SocketAddr,
-    status: Arc<RwLock<Status>>,
-    db: Arc<Db>,
-    tz: Tz,
-) -> Result<()> {
-    let state = ApiState { status, db, tz };
+async fn serve_http(addr: std::net::SocketAddr, state: ApiState) -> Result<()> {
     #[allow(unused_mut)]
     let mut app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -616,6 +720,8 @@ async fn serve_http(
         .route("/api/inverters", get(inverters_handler))
         .route("/api/history", get(history_handler))
         .route("/api/diagnostics", get(diagnostics_handler))
+        .route("/api/transmissions", get(transmissions_handler))
+        .route("/api/logs", get(logs_handler))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
     #[cfg(feature = "ui")]
@@ -625,6 +731,224 @@ async fn serve_http(
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// `400` naming the parameter the caller got wrong.
+fn bad_parameter(parameter: &str, detail: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": format!("{parameter}: {detail}"), "parameter": parameter })),
+    )
+        .into_response()
+}
+
+/// Resolve the page size, rejecting a value outside the supported range
+/// instead of silently clamping it.
+fn resolve_limit(limit: Option<i64>) -> std::result::Result<i64, String> {
+    match limit {
+        None => Ok(storage_diagnostics::DEFAULT_READ_LIMIT),
+        Some(limit) if (1..=storage_diagnostics::MAX_READ_LIMIT).contains(&limit) => Ok(limit),
+        Some(_) => Err(format!(
+            "must be between 1 and {}",
+            storage_diagnostics::MAX_READ_LIMIT
+        )),
+    }
+}
+
+/// Query parameters for `GET /api/transmissions`.
+///
+/// The three paging fields are repeated in [`LogParams`] rather than shared
+/// through `#[serde(flatten)]`: flattening routes every field through
+/// `deserialize_any`, and a query string only ever yields strings, so each
+/// numeric parameter would be rejected as `invalid type: string "100",
+/// expected i64`.
+#[derive(Deserialize)]
+struct TransmissionParams {
+    /// Return only entries newer than this cursor.
+    since: Option<i64>,
+    /// Return only entries older than this cursor, to page backwards.
+    before: Option<i64>,
+    /// Page size; defaults to 100 and is capped at 1000.
+    limit: Option<i64>,
+    /// Restrict to `ok`, `empty` or `failed`.
+    outcome: Option<String>,
+    /// Restrict to one collector target.
+    target: Option<String>,
+    /// Restrict to entries addressing or answered by one inverter.
+    serial: Option<u32>,
+}
+
+/// Query parameters for `GET /api/logs`.
+///
+/// See [`TransmissionParams`] for why the paging fields are not shared.
+#[derive(Deserialize)]
+struct LogParams {
+    /// Return only records newer than this cursor.
+    since: Option<i64>,
+    /// Return only records older than this cursor, to page backwards.
+    before: Option<i64>,
+    /// Page size; defaults to 100 and is capped at 1000.
+    limit: Option<i64>,
+    /// Return this level and everything more severe.
+    level: Option<String>,
+    /// Restrict to targets starting with this value.
+    target: Option<String>,
+}
+
+/// The window a ring is actually showing, next to the window it is configured
+/// for — a row cap reached before the window elapses shortens the history, and
+/// the difference has to be visible rather than implied.
+fn ring_envelope(
+    ring: RingBounds,
+    stats: storage_diagnostics::RingStats,
+    cursor: Option<i64>,
+    dropped: u64,
+) -> Value {
+    json!({
+        "cursor": cursor,
+        "retentionHours": ring.retention.map_or(0, |window| window.as_secs() / 3_600),
+        "maxEntries": ring.max_rows,
+        "retained": stats.retained,
+        "oldestOccurredAt": stats.oldest_occurred_at_ms,
+        "dropped": dropped,
+    })
+}
+
+/// `GET /api/transmissions` — one keyset page of recorded exchanges.
+async fn transmissions_handler(
+    State(state): State<ApiState>,
+    Query(params): Query<TransmissionParams>,
+) -> Response {
+    let limit = match resolve_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(detail) => return bad_parameter("limit", &detail),
+    };
+    if let Some(outcome) = &params.outcome {
+        if !matches!(outcome.as_str(), "ok" | "empty" | "failed") {
+            return bad_parameter("outcome", "must be one of ok, empty, failed");
+        }
+    }
+    if !state.transmission_ring.enabled() {
+        return Json(json!({
+            "entries": [],
+            "envelope": ring_envelope(
+                state.transmission_ring,
+                storage_diagnostics::RingStats::default(),
+                None,
+                0,
+            ),
+        }))
+        .into_response();
+    }
+
+    let filter = storage_diagnostics::TransmissionFilter {
+        since: params.since,
+        before: params.before,
+        limit,
+        outcome: params.outcome.clone(),
+        target: params.target.clone(),
+        serial: params.serial,
+    };
+    let entries = match state.db.read_transmissions(&filter).await {
+        Ok(entries) => entries,
+        Err(error) => return api_error(error),
+    };
+    let stats = match state.db.diagnostics_stats().await {
+        Ok(stats) => stats.transmissions,
+        Err(error) => return api_error(error),
+    };
+    let cursor = entries.first().map(|entry| entry.sequence);
+    let dropped = state.diagnostics.dropped();
+    let entries: Vec<Value> = entries.iter().map(transmission_json).collect();
+    Json(json!({
+        "entries": entries,
+        "envelope": ring_envelope(state.transmission_ring, stats, cursor, dropped),
+    }))
+    .into_response()
+}
+
+fn transmission_json(entry: &storage_diagnostics::StoredTransmission) -> Value {
+    let row = &entry.row;
+    json!({
+        "sequence": entry.sequence,
+        "occurredAt": row.occurred_at_ms,
+        "target": row.target,
+        "transport": row.transport,
+        "protocol": row.protocol,
+        "requestKind": row.request_kind,
+        "command": row.command,
+        "firstLri": row.first_lri,
+        "lastLri": row.last_lri,
+        "durationMs": row.duration_ms,
+        "totalFrames": row.total_frames,
+        "outcome": row.outcome,
+        "error": row.error,
+        "detail": row.detail,
+        "devices": row.devices.iter().map(|device| json!({
+            "serial": device.serial_number,
+            "frames": device.frame_count,
+            "addressed": device.addressed,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// `GET /api/logs` — one page of captured log records.
+///
+/// Served from process memory, not the database: the ring lives in
+/// [`crate::applog::LogBuffer`]. The response shape matches
+/// `/api/transmissions` so both System tabs share one client.
+async fn logs_handler(State(state): State<ApiState>, Query(params): Query<LogParams>) -> Response {
+    let limit = match resolve_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(detail) => return bad_parameter("limit", &detail),
+    };
+    let min_level = match params.level.as_deref().map(LogLevel::parse) {
+        None => None,
+        Some(Some(level)) => Some(level),
+        Some(None) => {
+            return bad_parameter("level", "must be one of error, warn, info, debug, trace")
+        }
+    };
+
+    let page = state.log_buffer.read(&LogQuery {
+        since: params.since.and_then(|value| u64::try_from(value).ok()),
+        before: params.before.and_then(|value| u64::try_from(value).ok()),
+        limit: usize::try_from(limit).unwrap_or(1),
+        min_level,
+        target_prefix: params.target.clone(),
+    });
+
+    let entries: Vec<Value> = page
+        .records
+        .iter()
+        .map(|record| {
+            json!({
+                "sequence": record.sequence,
+                "occurredAt": record.occurred_at_ms,
+                "level": record.level.as_str(),
+                "target": record.target,
+                "message": record.message,
+                "fields": record.fields,
+            })
+        })
+        .collect();
+    let cursor = page.records.first().map(|record| record.sequence);
+    Json(json!({
+        "entries": entries,
+        "envelope": {
+            "cursor": cursor,
+            "retentionHours": state.log_buffer.retention_hours(),
+            "maxEntries": state.log_buffer.max_records(),
+            "retained": page.stats.retained,
+            "oldestOccurredAt": page.stats.oldest_occurred_at_ms,
+            "dropped": page.stats.dropped,
+            // The ring's cursors restart with the process. A client holding a
+            // cursor from before a restart is told so, instead of silently
+            // never receiving another record.
+            "reset": page.reset,
+        },
+    }))
+    .into_response()
 }
 
 fn api_error(e: impl std::fmt::Display) -> Response {
@@ -1727,7 +2051,6 @@ mod tests {
     use axum::body::to_bytes;
     use axum::extract::{Query, State};
     use serde_json::{json, Map, Value};
-    use tokio::sync::RwLock;
 
     use crate::config::Config;
     use crate::domain::{
@@ -1741,14 +2064,16 @@ mod tests {
     };
 
     use super::{
-        browsable_base_url, build_day_metric_rows, build_day_summary, build_month_summary, build_week_summary,
-        build_year_summary, complete_year_buckets, diagnostic_efficiency, diagnostics_handler,
-        history_handler, inverter_target, merge_inverter_day_rows, parse_history_date,
-        parse_history_month, parse_history_week, parse_history_year, previous_month_comparison_end,
-        previous_week_comparison_end, previous_year_comparison_end, week_start, ApiState,
-        DiagnosticsParams, HistoryParams, Service, Status,
+        browsable_base_url, build_day_metric_rows, build_day_summary, build_month_summary,
+        build_week_summary, build_year_summary, complete_year_buckets, diagnostic_efficiency,
+        diagnostics_handler, history_handler, inverter_target, log_http_endpoints,
+        merge_inverter_day_rows, parse_history_date, parse_history_month, parse_history_week,
+        parse_history_year, previous_month_comparison_end, previous_week_comparison_end,
+        previous_year_comparison_end, resolve_limit, storage_diagnostics, transmissions_handler,
+        week_start, ApiState, DiagnosticsParams, HistoryParams, LogParams, RingBounds, Service,
+        TransmissionParams,
     };
-    use super::log_http_endpoints;
+    use super::{logs_handler, LogBuffer, LogLevel, Response, StatusCode};
 
     #[test]
     fn wildcard_binds_are_reported_as_loopback() {
@@ -1765,7 +2090,7 @@ mod tests {
     #[test]
     fn endpoint_log_renders_openable_urls() {
         #[derive(Clone, Default)]
-        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
 
         impl std::io::Write for Buffer {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1834,6 +2159,358 @@ mod tests {
         assert!(parse_history_date(Some("25.07.2026")).is_err());
         assert!(parse_history_date(Some("2026-02-30")).is_err());
         assert_eq!(parse_history_date(None).expect("optional date"), None);
+    }
+
+    /// A database with the diagnostics rings enabled and `count` recorded
+    /// transmissions, oldest first.
+    async fn seeded_rings(directory: &tempfile::TempDir, count: i64) -> Db {
+        let database_url = format!("sqlite://{}", directory.path().join("rings.db").display());
+        let db = Db::connect(&database_url, Tz::UTC).await.unwrap();
+        db.enable_diagnostics().await.unwrap();
+        let rows: Vec<storage_diagnostics::TransmissionRow> = (0..count)
+            .map(|i| storage_diagnostics::TransmissionRow {
+                occurred_at_ms: 1_000 + i,
+                target: if i % 2 == 0 { "eth" } else { "bt" }.to_owned(),
+                transport: "ethernet".to_owned(),
+                protocol: "sma_data_2_plus".to_owned(),
+                request_kind: "spot.ac_power".to_owned(),
+                command: Some(0x5100_0200),
+                first_lri: Some(0x0046_4000),
+                last_lri: Some(0x0046_42FF),
+                duration_ms: 5,
+                total_frames: 1,
+                outcome: if i == 0 { "failed" } else { "ok" }.to_owned(),
+                error: (i == 0).then(|| "timeout".to_owned()),
+                detail: None,
+                devices: vec![storage_diagnostics::TransmissionDeviceRow {
+                    serial_number: 11,
+                    frame_count: 1,
+                    addressed: true,
+                }],
+            })
+            .collect();
+        db.write_transmissions(&rows).await.unwrap();
+        db
+    }
+
+    /// A state whose log buffer already holds one info and one error record.
+    fn state_with_log_records(db: Arc<Db>) -> ApiState {
+        let state = ApiState::for_tests(db, Tz::UTC);
+        state.log_buffer.capture_for_test(
+            1_000,
+            LogLevel::Info,
+            "smalog::service",
+            "started",
+            None,
+        );
+        state.log_buffer.capture_for_test(
+            2_000,
+            LogLevel::Error,
+            "smalog::service",
+            "poll failed",
+            Some("serial=11"),
+        );
+        state
+    }
+
+    fn transmission_params(
+        since: Option<i64>,
+        before: Option<i64>,
+        limit: Option<i64>,
+    ) -> TransmissionParams {
+        TransmissionParams {
+            since,
+            before,
+            limit,
+            outcome: None,
+            target: None,
+            serial: None,
+        }
+    }
+
+    fn log_params(limit: Option<i64>) -> LogParams {
+        LogParams {
+            since: None,
+            before: None,
+            limit,
+            level: None,
+            target: None,
+        }
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The query string is where the two System endpoints actually meet the
+    /// outside world, and constructing their parameter structs in Rust skips
+    /// exactly that step. These parse real URIs through the same extractor
+    /// axum uses, which is what a shared `#[serde(flatten)]` silently broke:
+    /// every numeric parameter came back as `invalid type: string "100",
+    /// expected i64`, so the dashboard's very first request failed.
+    #[test]
+    fn transmission_query_parameters_deserialize_from_a_real_uri() {
+        let uri: axum::http::Uri =
+            "/api/transmissions?since=5&before=90&limit=100&outcome=failed&target=eth&serial=42"
+                .parse()
+                .unwrap();
+        let Query(params) = Query::<TransmissionParams>::try_from_uri(&uri)
+            .expect("every supported parameter must parse");
+
+        assert_eq!(params.since, Some(5));
+        assert_eq!(params.before, Some(90));
+        assert_eq!(params.limit, Some(100));
+        assert_eq!(params.outcome.as_deref(), Some("failed"));
+        assert_eq!(params.target.as_deref(), Some("eth"));
+        assert_eq!(params.serial, Some(42));
+    }
+
+    #[test]
+    fn log_query_parameters_deserialize_from_a_real_uri() {
+        let uri: axum::http::Uri =
+            "/api/logs?since=5&before=90&limit=100&level=warn&target=smalog::service"
+                .parse()
+                .unwrap();
+        let Query(params) =
+            Query::<LogParams>::try_from_uri(&uri).expect("every supported parameter must parse");
+
+        assert_eq!(params.since, Some(5));
+        assert_eq!(params.before, Some(90));
+        assert_eq!(params.limit, Some(100));
+        assert_eq!(params.level.as_deref(), Some("warn"));
+        assert_eq!(params.target.as_deref(), Some("smalog::service"));
+    }
+
+    #[test]
+    fn each_paging_parameter_parses_on_its_own() {
+        // The bug only showed when a numeric parameter was present at all, so
+        // an empty query string kept working and hid it.
+        for query in ["", "since=1", "before=1", "limit=1", "since=1&limit=2"] {
+            let uri: axum::http::Uri = format!("/api/transmissions?{query}").parse().unwrap();
+            assert!(
+                Query::<TransmissionParams>::try_from_uri(&uri).is_ok(),
+                "transmissions rejected {query:?}"
+            );
+            let uri: axum::http::Uri = format!("/api/logs?{query}").parse().unwrap();
+            assert!(
+                Query::<LogParams>::try_from_uri(&uri).is_ok(),
+                "logs rejected {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dashboard_default_request_parses() {
+        // What the System views send on their first load and every refresh.
+        let uri: axum::http::Uri = "/api/transmissions?limit=100".parse().unwrap();
+        let Query(params) = Query::<TransmissionParams>::try_from_uri(&uri).expect("first load");
+        assert_eq!(resolve_limit(params.limit), Ok(100));
+    }
+
+    #[test]
+    fn a_non_numeric_paging_value_is_still_rejected() {
+        let uri: axum::http::Uri = "/api/transmissions?limit=lots".parse().unwrap();
+        assert!(Query::<TransmissionParams>::try_from_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn resolve_limit_defaults_and_bounds_the_page() {
+        assert_eq!(
+            resolve_limit(None),
+            Ok(storage_diagnostics::DEFAULT_READ_LIMIT)
+        );
+        assert_eq!(resolve_limit(Some(1)), Ok(1));
+        assert_eq!(
+            resolve_limit(Some(storage_diagnostics::MAX_READ_LIMIT)),
+            Ok(storage_diagnostics::MAX_READ_LIMIT)
+        );
+        assert!(resolve_limit(Some(0)).is_err());
+        assert!(resolve_limit(Some(storage_diagnostics::MAX_READ_LIMIT + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn transmissions_handler_returns_newest_first_with_its_envelope() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = seeded_rings(&directory, 5).await;
+        let state = ApiState::for_tests(Arc::new(db), Tz::UTC);
+
+        let body = body_json(
+            transmissions_handler(State(state), Query(transmission_params(None, None, None))).await,
+        )
+        .await;
+
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0]["occurredAt"], 1_004);
+        assert_eq!(entries[0]["requestKind"], "spot.ac_power");
+        assert_eq!(entries[0]["command"], 0x5100_0200);
+        assert_eq!(entries[0]["devices"][0]["serial"], 11);
+        let envelope = &body["envelope"];
+        assert_eq!(envelope["retained"], 5);
+        assert_eq!(envelope["retentionHours"], 48);
+        assert_eq!(envelope["maxEntries"], 50_000);
+        assert_eq!(envelope["oldestOccurredAt"], 1_000);
+        assert_eq!(envelope["dropped"], 0);
+        assert_eq!(envelope["cursor"], entries[0]["sequence"]);
+    }
+
+    #[tokio::test]
+    async fn transmissions_handler_pages_with_since_and_before() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = seeded_rings(&directory, 6).await;
+        let state = ApiState::for_tests(Arc::new(db), Tz::UTC);
+
+        let first = body_json(
+            transmissions_handler(
+                State(state.clone()),
+                Query(transmission_params(None, None, Some(2))),
+            )
+            .await,
+        )
+        .await;
+        let first_entries = first["entries"].as_array().unwrap();
+        assert_eq!(first_entries.len(), 2);
+        let oldest_seen = first_entries[1]["sequence"].as_i64().unwrap();
+
+        let older = body_json(
+            transmissions_handler(
+                State(state.clone()),
+                Query(transmission_params(None, Some(oldest_seen), Some(10))),
+            )
+            .await,
+        )
+        .await;
+        let older_entries = older["entries"].as_array().unwrap();
+        assert_eq!(older_entries.len(), 4);
+        assert!(older_entries
+            .iter()
+            .all(|entry| entry["sequence"].as_i64().unwrap() < oldest_seen));
+
+        // Following the tail from the newest cursor yields nothing new.
+        let newest = first_entries[0]["sequence"].as_i64().unwrap();
+        let tail = body_json(
+            transmissions_handler(
+                State(state),
+                Query(transmission_params(Some(newest), None, Some(10))),
+            )
+            .await,
+        )
+        .await;
+        assert!(tail["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transmissions_handler_applies_each_filter() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = seeded_rings(&directory, 4).await;
+        let state = ApiState::for_tests(Arc::new(db), Tz::UTC);
+
+        let mut params = transmission_params(None, None, Some(10));
+        params.outcome = Some("failed".to_owned());
+        let failed =
+            body_json(transmissions_handler(State(state.clone()), Query(params)).await).await;
+        assert_eq!(failed["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(failed["entries"][0]["error"], "timeout");
+
+        let mut params = transmission_params(None, None, Some(10));
+        params.target = Some("bt".to_owned());
+        let by_target =
+            body_json(transmissions_handler(State(state.clone()), Query(params)).await).await;
+        assert_eq!(by_target["entries"].as_array().unwrap().len(), 2);
+
+        let mut params = transmission_params(None, None, Some(10));
+        params.serial = Some(11);
+        let by_serial =
+            body_json(transmissions_handler(State(state.clone()), Query(params)).await).await;
+        assert_eq!(by_serial["entries"].as_array().unwrap().len(), 4);
+
+        let mut params = transmission_params(None, None, Some(10));
+        params.serial = Some(999);
+        let unknown = body_json(transmissions_handler(State(state), Query(params)).await).await;
+        assert!(unknown["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_handlers_reject_a_malformed_parameter_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(seeded_rings(&directory, 1).await);
+        let state = ApiState::for_tests(db, Tz::UTC);
+
+        let mut params = transmission_params(None, None, Some(10));
+        params.outcome = Some("maybe".to_owned());
+        let response = transmissions_handler(State(state.clone()), Query(params)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["parameter"], "outcome");
+
+        let response = transmissions_handler(
+            State(state.clone()),
+            Query(transmission_params(None, None, Some(0))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["parameter"], "limit");
+
+        let response = transmissions_handler(
+            State(state.clone()),
+            Query(transmission_params(None, None, Some(1_001))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let mut params = log_params(Some(10));
+        params.level = Some("verbose".to_owned());
+        let response = logs_handler(State(state), Query(params)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["parameter"], "level");
+    }
+
+    #[tokio::test]
+    async fn logs_handler_returns_records_and_filters_by_level() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(seeded_rings(&directory, 1).await);
+        let state = state_with_log_records(db);
+
+        let body =
+            body_json(logs_handler(State(state.clone()), Query(log_params(None))).await).await;
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["message"], "poll failed");
+        assert_eq!(entries[0]["level"], "error");
+        assert_eq!(entries[0]["fields"], "serial=11");
+        assert_eq!(body["envelope"]["retained"], 2);
+
+        let mut params = log_params(Some(10));
+        params.level = Some("warn".to_owned());
+        let warn = body_json(logs_handler(State(state), Query(params)).await).await;
+        assert_eq!(warn["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_rings_return_an_empty_page_rather_than_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(seeded_rings(&directory, 3).await);
+        let mut state = ApiState::for_tests(db, Tz::UTC);
+        state.transmission_ring = RingBounds::new(0, 50_000);
+        state.log_buffer = LogBuffer::new(0, 50_000);
+
+        let body = body_json(
+            transmissions_handler(
+                State(state.clone()),
+                Query(transmission_params(None, None, None)),
+            )
+            .await,
+        )
+        .await;
+        assert!(body["entries"].as_array().unwrap().is_empty());
+        assert_eq!(body["envelope"]["retentionHours"], 0);
+        assert_eq!(body["envelope"]["retained"], 0);
+
+        let body = body_json(logs_handler(State(state), Query(log_params(None))).await).await;
+        assert!(body["entries"].as_array().unwrap().is_empty());
+        assert_eq!(body["envelope"]["retentionHours"], 0);
     }
 
     #[test]
@@ -1922,11 +2599,7 @@ mod tests {
             ]
         );
 
-        let state = ApiState {
-            status: Arc::new(RwLock::new(Status::default())),
-            db: Arc::new(db),
-            tz: Tz::UTC,
-        };
+        let state = ApiState::for_tests(Arc::new(db), Tz::UTC);
         let response = diagnostics_handler(
             State(state),
             Query(DiagnosticsParams {
@@ -2109,11 +2782,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!table_exists);
-        let state = ApiState {
-            status: Arc::new(RwLock::new(Status::default())),
-            db: Arc::new(db),
-            tz: Tz::UTC,
-        };
+        let state = ApiState::for_tests(Arc::new(db), Tz::UTC);
 
         let response = day_history_response(state, date(2024, 6, 1)).await;
         assert!(response.get("dailyStatistics").is_none());
@@ -2150,11 +2819,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let state = ApiState {
-            status: Arc::new(RwLock::new(Status::default())),
-            db: Arc::new(db),
-            tz: Tz::UTC,
-        };
+        let state = ApiState::for_tests(Arc::new(db), Tz::UTC);
 
         let response = day_history_response(state, selected_date).await;
         assert_eq!(
@@ -2221,11 +2886,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        let state = ApiState {
-            status: Arc::new(RwLock::new(Status::default())),
-            db: Arc::new(db),
-            tz: Tz::UTC,
-        };
+        let state = ApiState::for_tests(Arc::new(db), Tz::UTC);
 
         let response = day_history_response(state, selected_date).await;
         assert_eq!(
@@ -2288,11 +2949,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        let state = ApiState {
-            status: Arc::new(RwLock::new(Status::default())),
-            db: Arc::new(db),
-            tz: chrono_tz::Europe::Berlin,
-        };
+        let state = ApiState::for_tests(Arc::new(db), chrono_tz::Europe::Berlin);
 
         let week = history_response(state.clone(), "week", Some("2025-01-01"), None, None).await;
         assert_eq!(
@@ -2363,11 +3020,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        let state = ApiState {
-            status: Arc::new(RwLock::new(Status::default())),
-            db: Arc::new(db),
-            tz: chrono_tz::Europe::Berlin,
-        };
+        let state = ApiState::for_tests(Arc::new(db), chrono_tz::Europe::Berlin);
 
         let week = history_response(state, "week", Some("2024-03-27"), None, None).await;
         assert_eq!(

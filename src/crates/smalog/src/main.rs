@@ -8,10 +8,16 @@ use std::process::ExitCode;
 
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand, ValueEnum};
-use tracing::error;
-use tracing_subscriber::EnvFilter;
+use std::sync::Arc;
 
+use tracing::error;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
+
+use smalog::applog::{CaptureLayer, LogBuffer};
 use smalog::config::{Config, InverterConfig, LogFormat};
+use smalog::diagnostics::WriteQueue;
 use smalog::migrate::{self, MigrateOptions, MigrationMode, PvOutputStateMode};
 use smalog::service::Service;
 use smalog::storage::{DailyYieldStatus, Db};
@@ -104,18 +110,29 @@ enum PvOutputStateArg {
     LegacyFlag,
 }
 
-fn init_logging(cfg: Option<&Config>) {
+/// Install the global subscriber: the configured stdout format, plus the
+/// in-memory capture layer when `capture` is given.
+///
+/// Both layers sit behind the same `EnvFilter`, so `[log] level` keeps
+/// controlling stdout and the captured ring alike, and the ring can never
+/// hold a record stdout did not also receive.
+fn init_logging(cfg: Option<&Config>, capture: Option<Arc<LogBuffer>>) {
     let (level, format) = cfg
         .map(|c| (c.log.level.clone(), c.log.format))
         .unwrap_or_else(|| ("info".into(), LogFormat::Text));
     let filter = EnvFilter::try_new(&level)
         .or_else(|_| EnvFilter::try_new("info"))
         .expect("valid default filter");
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    match format {
-        LogFormat::Json => builder.json().init(),
-        LogFormat::Text => builder.init(),
-    }
+    // Boxing lets the JSON and text formatters share one layer type.
+    let output = match format {
+        LogFormat::Json => tracing_subscriber::fmt::layer().json().boxed(),
+        LogFormat::Text => tracing_subscriber::fmt::layer().boxed(),
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(output)
+        .with(capture.map(CaptureLayer::new))
+        .init();
 }
 
 #[tokio::main]
@@ -125,7 +142,7 @@ async fn main() -> ExitCode {
 
     match command {
         Command::Discover => {
-            init_logging(None);
+            init_logging(None, None);
             // Enumerate every transport represented in the configuration;
             // without a readable config, fall back to Ethernet discovery.
             let config = Config::load(&cli.config).ok();
@@ -279,13 +296,22 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            init_logging(Some(&config));
+            // The queue feeds the persisted transmission ring; the log ring
+            // is process memory and is handed to the capture layer directly,
+            // so a log call never reaches a database.
+            let queue = WriteQueue::new(smalog::diagnostics::QUEUE_CAPACITY);
+            let log_buffer = LogBuffer::new(
+                config.service.application_log_retention_hours,
+                config.service.application_log_max_entries,
+            );
+            let capture = log_buffer.enabled().then(|| log_buffer.clone());
+            init_logging(Some(&config), capture);
             tracing::info!(version = smalog::VERSION, "smalog — SMA inverter logger");
             let once = matches!(command, Command::Once);
-            match Service::new(config).await {
+            match Service::new(config, queue, log_buffer).await {
                 Ok(mut service) => {
                     let res = if once {
-                        service.tick().await;
+                        service.tick_once().await;
                         Ok(())
                     } else {
                         service.run().await
@@ -389,7 +415,7 @@ async fn test_bluetooth(config_path: &std::path::Path, all: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    init_logging(Some(&config));
+    init_logging(Some(&config), None);
     let tz = match config.timezone() {
         Ok(tz) => tz,
         Err(error) => {
@@ -661,7 +687,7 @@ async fn set_inverter_time(config_path: &std::path::Path, mode: ClockMode) -> Ex
             return ExitCode::FAILURE;
         }
     };
-    init_logging(Some(&config));
+    init_logging(Some(&config), None);
     let bluetooth: Vec<_> = config
         .inverters
         .iter()

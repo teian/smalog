@@ -3,6 +3,7 @@
 //! This crate is the persistence boundary shared by the logger service and
 //! import tools. It does not depend on either application.
 
+pub mod diagnostics;
 pub mod domain;
 pub mod error;
 pub mod schema;

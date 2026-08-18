@@ -38,7 +38,11 @@ migrator.
   `/status` HTTP endpoints.
 - **Web dashboard** — an optional React/shadcn UI ([src/ui](src/ui/))
   showing live and historic (day/week/month/year) production via a small
-  `/api/*` JSON API. See [docs/ui.md](docs/ui.md).
+  `/api/*` JSON API. Its **System** area shows every request the poll cycle
+  sends to an inverter — stored, so it survives a restart — and the service's
+  own log from an in-memory ring, both covering two days, so a silent inverter
+  can be diagnosed without shell access to the host. See
+  [docs/ui.md](docs/ui.md).
 - **Config in TOML** with `${ENV_VAR}` expansion so secrets stay out of
   the file.
 

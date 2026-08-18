@@ -8,8 +8,10 @@
 //! This is an independent implementation rather than a 1:1 SBFspot port.
 //! Licensed under the EUPL-1.2.
 
+pub mod applog;
 pub mod config;
 pub mod daylight;
+pub mod diagnostics;
 pub mod error;
 pub mod service;
 

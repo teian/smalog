@@ -11,11 +11,36 @@ and stores the selection locally in the browser. Translations, date/number
 formatting, and all required assets are part of the embedded UI bundle; no
 external localization service is contacted.
 
-The four primary data areas are available from a persistent sidebar on desktop:
-**Energy data**, **Events**, **Device statistics**, and **Grid quality**. On
-smaller screens the same navigation becomes a two-column touch target grid
-above the content. The inverter filter remains available in every area, while
-period tabs are shown only for energy history.
+The five primary data areas are available from a persistent sidebar on desktop:
+**Energy data**, **Events**, **Device statistics**, **Grid quality**, and
+**System**. On smaller screens the same navigation becomes a two-column touch
+target grid above the content. The inverter filter remains available in every
+area, while period tabs are shown only for energy history.
+
+The **System** area holds two tabs in the same header position the period tabs
+occupy for energy history: **Transmissions** and **Application log**. Both are
+read-only, refresh every 5 s while visible, offer a pause control and filters,
+and load older entries on demand back to the oldest retained one. The inverter
+filter narrows the transmissions tab; log records are not attributed to a
+single inverter, so the log tab states that the filter does not apply there.
+
+Both behave as a ring — entries older than the configured retention window
+(48 h by default) are dropped automatically, and an entry cap bounds each —
+but they are kept in different places, on purpose:
+
+- **Transmissions** are stored in the database and **survive a restart**, so
+  the exchanges leading up to a crash are still there afterwards.
+- The **application log** is kept in the service's **memory only** and is
+  **lost on restart**. A log line is cheap to emit and expensive to store, and
+  persisting one would put a database write behind every log call. The systemd
+  journal or container log remains the durable copy, and the view says so.
+
+Because the entry cap can be reached before the window elapses, each view
+states the window it is actually showing rather than claiming the configured
+one. The log view exposes captured log content to anyone who can reach the
+dashboard; see [operations](operations.md) on keeping it behind a reverse
+proxy, and [configuration](configuration.md#service) for switching capture
+off.
 
 ## HTTP API
 
@@ -30,6 +55,8 @@ served from a different origin during development.
 | `GET /api/inverters` | `[{ serial, name }]` — for the filter selector. |
 | `GET /api/history?range=…` | A labelled, multi-series dataset (see below). |
 | `GET /api/diagnostics?date=…&serial=…` | Electrical day samples, lifetime inverter details, and recent warning/fault events. |
+| `GET /api/transmissions?…` | One keyset page of recorded inverter exchanges. |
+| `GET /api/logs?…` | One keyset page of captured application log records. |
 
 ### `/api/history`
 
@@ -136,6 +163,86 @@ The field is omitted when the optional table is disabled; reading history does
 not create or require that table. `stale` compares the cached source watermark
 and count with canonical measurements bounded to the selected local day.
 
+### `/api/transmissions` and `/api/logs`
+
+Both read a runtime-diagnostics ring and share one paging contract. Entries
+are newest first and identified by a monotonic `sequence`. For transmissions
+that cursor is the database key, so it survives restarts and pruning; for log
+records it is process-local and restarts with the service (see `reset`
+below):
+
+- `since` — only entries newer than this cursor; this is how a view follows
+  the live tail.
+- `before` — only entries older than this cursor; this is how a view pages
+  backwards through the retained window. An empty result means the oldest
+  retained entry has been reached.
+- `limit` — page size, default `100`, maximum `1000`. A value outside that
+  range is a `400` naming the parameter, not a silent clamp.
+
+`/api/transmissions` additionally accepts `outcome` (`ok` | `empty` |
+`failed`), `target` (one collector endpoint) and `serial` (entries addressing
+or answered by that inverter). `/api/logs` accepts `level` (that level and
+everything more severe) and `target` (a target prefix). Every filter is applied
+in SQL against an index, so a filter matching almost nothing costs no more than
+one matching everything.
+
+Both responses carry the same envelope:
+
+```json
+{ "entries": [ … ],
+  "envelope": {
+    "cursor": 48213,
+    "retentionHours": 48,
+    "maxEntries": 50000,
+    "retained": 34512,
+    "oldestOccurredAt": 1785103200000,
+    "dropped": 0
+  } }
+```
+
+`oldestOccurredAt` next to `retentionHours` is what distinguishes a full
+48-hour window from one the entry cap cut short. `dropped` counts entries lost
+to that cap, or — for transmissions — because the background writer fell
+behind; a gap in the data is then a drop, not a quiet inverter. A ring whose
+retention is `0` returns an empty entry list and `"retentionHours": 0` rather
+than an error.
+
+`/api/logs` adds `"reset": true` when the `since` cursor sent was ahead of
+everything the buffer holds. That means the service restarted and its
+process-local sequence began again; the page starts from the newest record so
+a dashboard held open across a restart resumes instead of stalling.
+
+One transmission entry:
+
+```json
+{ "sequence": 48213, "occurredAt": 1785189300123,
+  "target": "192.168.1.20", "transport": "ethernet",
+  "protocol": "sma_data_2_plus", "requestKind": "spot.ac_power",
+  "command": 1358954496, "firstLri": 4604928, "lastLri": 4605183,
+  "durationMs": 42, "totalFrames": 2, "outcome": "ok",
+  "error": null, "detail": null,
+  "devices": [ { "serial": 2100123456, "frames": 2, "addressed": true } ] }
+```
+
+`requestKind` is a stable identifier (`spot.*`, `archive.*`, `session.*`);
+session steps — `session.begin`, `session.login`, `session.clock_sync`,
+`session.end` — are recorded as entries of their own, so a failed login is
+visible as such. `error` is set only for `outcome: "failed"`; `detail` carries
+a note for a successful step, such as why a clock sync was skipped. Frame
+payloads are never recorded.
+
+One log record:
+
+```json
+{ "sequence": 9912, "occurredAt": 1785189300123, "level": "error",
+  "target": "smalog::service", "message": "inverter poll failed",
+  "fields": "serial=2100123456 error=timeout" }
+```
+
+The records are exactly what the configured `[log] level` already writes to
+stdout — capture adds no field and suppresses none. They are served from the
+service's memory; nothing about them is stored.
+
 ### `/api/diagnostics`
 
 The diagnostics endpoint accepts a local `date=YYYY-MM-DD` and optional
@@ -231,6 +338,13 @@ reverse proxy).
   mobile data-area navigation.
 - `src/components/DiagnosticsView.tsx` — sectioned MPPT/grid charts, device
   statistics, and warning/fault history for the selected inverter scope.
+- `src/components/SystemView.tsx` — the System area: cursor polling, pause,
+  load-older paging, and the window/dropped/refresh-failure status shared by
+  both tabs.
+- `src/components/TransmissionsTable.tsx`, `ApplicationLogView.tsx` — the two
+  System tabs.
+- `src/lib/systemLog.ts` — merging cursor pages in both directions and
+  deciding what the view should say about the window it is showing.
 - `public/` — bundled SMAlog light/dark header logos, favicons, Apple touch
   icon, and web app manifest; all are copied into the embedded production UI.
 - `src/App.tsx` — polls status every 30 s and wires the range tabs to the

@@ -7,6 +7,8 @@
 //! `Inverter::process()` loops.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::{Datelike, Utc};
 use chrono_tz::Tz;
@@ -22,6 +24,9 @@ use crate::smadata2::commands::{QueryKind, CMD_ARCHIVE_DAY, CMD_ARCHIVE_MONTH};
 use crate::smadata2::decode::decode_spot_records;
 use crate::smadata2::inverter::InverterData;
 use crate::speedwire::packet::Datagram;
+use crate::transmission::{
+    PollTransmission, TransmissionKind, TransmissionOutcome, TransmissionSink,
+};
 use smalog_observation::PollCycleObservation;
 
 /// Poll behaviour toggles (SBFspot CalcMissingSpot / consumption).
@@ -43,6 +48,8 @@ pub struct Collector {
     /// serial → month-data wobble offset, probed once (issues 115/130).
     month_offsets: HashMap<u32, i64>,
     offsets_probed: bool,
+    /// Optional diagnostics channel; `None` means nothing is recorded.
+    sink: Option<Arc<dyn TransmissionSink>>,
 }
 
 impl Collector {
@@ -55,7 +62,119 @@ impl Collector {
             inverters: Vec::new(),
             month_offsets: HashMap::new(),
             offsets_probed: false,
+            sink: None,
         }
+    }
+
+    /// Build a collector that also reports every exchange to `sink`.
+    ///
+    /// Recording is purely additive: the poll sequence, its results and its
+    /// error handling are identical to [`Collector::new`].
+    pub fn with_sink(
+        connector: Box<dyn Connection>,
+        tz: Tz,
+        opts: PollOptions,
+        sink: Arc<dyn TransmissionSink>,
+    ) -> Collector {
+        Collector {
+            sink: Some(sink),
+            ..Collector::new(connector, tz, opts)
+        }
+    }
+
+    /// Time one connector request and record it as a transmission.
+    ///
+    /// The request's result is returned unchanged, and nothing at all happens
+    /// when no sink is configured — including the device lookup and the
+    /// clock reads.
+    async fn request_recorded(
+        &mut self,
+        kind: TransmissionKind,
+        command: u32,
+        first: u32,
+        last: u32,
+        events: bool,
+    ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+        if self.sink.is_none() {
+            return self
+                .connector
+                .request_all(command, first, last, events)
+                .await;
+        }
+        let started_at_ms = Utc::now().timestamp_millis();
+        let mut addressed: Vec<u32> = self.connector.devices().iter().map(|d| d.serial).collect();
+        addressed.sort_unstable();
+        let clock = Instant::now();
+        let result = self
+            .connector
+            .request_all(command, first, last, events)
+            .await;
+        let duration_ms = elapsed_ms(clock);
+        let (protocol, transport) = self.connector.communication();
+        let mut transmission = PollTransmission::step(
+            started_at_ms,
+            protocol,
+            transport,
+            kind,
+            duration_ms,
+            TransmissionOutcome::Ok,
+        );
+        transmission.command = Some(command);
+        transmission.first_lri = Some(first);
+        transmission.last_lri = Some(last);
+        transmission.addressed_serials = addressed;
+        match &result {
+            Ok(map) => {
+                for (serial, frames) in map {
+                    let count = u32::try_from(frames.len()).unwrap_or(u32::MAX);
+                    if count > 0 {
+                        transmission.frames_by_serial.insert(*serial, count);
+                    }
+                }
+                transmission.total_frames = transmission
+                    .frames_by_serial
+                    .values()
+                    .fold(0u32, |sum, count| sum.saturating_add(*count));
+                if transmission.total_frames == 0 {
+                    transmission.outcome = TransmissionOutcome::Empty;
+                }
+            }
+            Err(error) => {
+                transmission.outcome = TransmissionOutcome::Failed;
+                transmission.error = Some(error.to_string());
+            }
+        }
+        if let Some(sink) = &self.sink {
+            sink.record(transmission);
+        }
+        result
+    }
+
+    /// Record one session step (begin, login, clock sync, end).
+    fn record_session_step(
+        &self,
+        kind: TransmissionKind,
+        started_at_ms: i64,
+        clock: Instant,
+        outcome: TransmissionOutcome,
+        error: Option<String>,
+        detail: Option<String>,
+    ) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let (protocol, transport) = self.connector.communication();
+        let mut transmission = PollTransmission::step(
+            started_at_ms,
+            protocol,
+            transport,
+            kind,
+            elapsed_ms(clock),
+            outcome,
+        );
+        transmission.error = error;
+        transmission.detail = detail;
+        sink.record(transmission);
     }
 
     /// Last polled snapshot (also returned by [`Self::cycle`]).
@@ -70,17 +189,17 @@ impl Collector {
         fetch_day: bool,
         daily: Option<(u32, u32)>,
     ) -> Result<Vec<InverterData>> {
-        self.connector.begin().await?;
+        self.begin_recorded().await?;
         self.rebuild_inverters();
 
         // Once begin() succeeds, always tear the session down. In particular,
         // a failed login must not leave Bluetooth or a partially logged-in
         // multi-inverter connection behind for the next poll cycle.
-        let res = match self.connector.login_all().await {
+        let res = match self.login_recorded().await {
             Ok(()) => self.run(fetch_day, daily).await,
             Err(error) => Err(error),
         };
-        self.connector.end().await;
+        self.end_recorded().await;
 
         res?;
         Ok(self.inverters.clone())
@@ -135,15 +254,15 @@ impl Collector {
     }
 
     async fn probe_inner(&mut self, all: bool) -> Result<(Vec<InverterData>, usize)> {
-        self.connector.begin().await?;
+        self.begin_recorded().await?;
         self.rebuild_inverters();
 
-        let result = match self.connector.login_all().await {
+        let result = match self.login_recorded().await {
             Ok(()) if all => Ok(self.query_sequence(false).await),
             Ok(()) => Ok(self.probe_sequence().await),
             Err(error) => Err(error),
         };
-        self.connector.end().await;
+        self.end_recorded().await;
 
         let received_frames = result?;
         Ok((self.inverters.clone(), received_frames))
@@ -197,13 +316,91 @@ impl Collector {
     }
 
     async fn clock_sync(&mut self) {
-        match self.connector.set_clock(ClockMode::Auto).await {
+        let started_at_ms = Utc::now().timestamp_millis();
+        let clock = Instant::now();
+        let sync = self.connector.set_clock(ClockMode::Auto).await;
+        match &sync {
             Ok(SyncOutcome::Set) => info!("inverter clock synchronised"),
             Ok(SyncOutcome::Skipped(r)) => debug!(reason = r, "clock sync skipped"),
             Ok(SyncOutcome::VerifyFailed { drift }) => warn!(drift, "clock sync not confirmed"),
             Ok(SyncOutcome::Unsupported) => {}
             Err(e) => warn!(error = %e, "clock sync failed"),
         }
+        // A gated or unsupported clock sync is not a failure: the cycle does
+        // not treat it as one, so neither does its transmission entry.
+        let (outcome, error, detail) = match &sync {
+            Ok(SyncOutcome::Set) => (TransmissionOutcome::Ok, None, None),
+            Ok(SyncOutcome::Skipped(reason)) => {
+                (TransmissionOutcome::Ok, None, Some((*reason).to_owned()))
+            }
+            Ok(SyncOutcome::Unsupported) => (
+                TransmissionOutcome::Ok,
+                None,
+                Some("transport cannot set the inverter clock".to_owned()),
+            ),
+            Ok(SyncOutcome::VerifyFailed { drift }) => (
+                TransmissionOutcome::Failed,
+                Some(format!("clock written, {drift} s drift remaining")),
+                None,
+            ),
+            Err(error) => (TransmissionOutcome::Failed, Some(error.to_string()), None),
+        };
+        self.record_session_step(
+            TransmissionKind::ClockSync,
+            started_at_ms,
+            clock,
+            outcome,
+            error,
+            detail,
+        );
+    }
+
+    /// `Connection::begin`, recorded as its own transmission.
+    async fn begin_recorded(&mut self) -> Result<()> {
+        let started_at_ms = Utc::now().timestamp_millis();
+        let clock = Instant::now();
+        let begun = self.connector.begin().await;
+        self.record_session_step(
+            TransmissionKind::SessionBegin,
+            started_at_ms,
+            clock,
+            outcome_of(&begun),
+            begun.as_ref().err().map(|error| error.to_string()),
+            None,
+        );
+        begun
+    }
+
+    /// `Connection::login_all`, recorded as its own transmission.
+    async fn login_recorded(&mut self) -> Result<()> {
+        let started_at_ms = Utc::now().timestamp_millis();
+        let clock = Instant::now();
+        let login = self.connector.login_all().await;
+        self.record_session_step(
+            TransmissionKind::Login,
+            started_at_ms,
+            clock,
+            outcome_of(&login),
+            login.as_ref().err().map(|error| error.to_string()),
+            None,
+        );
+        login
+    }
+
+    /// `Connection::end`, recorded as its own transmission. Teardown is best
+    /// effort and cannot fail, so its outcome is always `ok`.
+    async fn end_recorded(&mut self) {
+        let started_at_ms = Utc::now().timestamp_millis();
+        let clock = Instant::now();
+        self.connector.end().await;
+        self.record_session_step(
+            TransmissionKind::SessionEnd,
+            started_at_ms,
+            clock,
+            TransmissionOutcome::Ok,
+            None,
+            None,
+        );
     }
 
     fn index_of(&self, serial: u32) -> Option<usize> {
@@ -215,8 +412,13 @@ impl Collector {
     async fn query(&mut self, kind: QueryKind) -> usize {
         let q = kind.query();
         let map = match self
-            .connector
-            .request_all(q.command, q.first, q.last, false)
+            .request_recorded(
+                TransmissionKind::Spot(kind),
+                q.command,
+                q.first,
+                q.last,
+                false,
+            )
             .await
         {
             Ok(m) => m,
@@ -297,8 +499,13 @@ impl Collector {
         let now = Utc::now().timestamp();
         let (target_day, first, last) = day_request_window(now, self.tz);
         let Ok(map) = self
-            .connector
-            .request_all(CMD_ARCHIVE_DAY, first, last, false)
+            .request_recorded(
+                TransmissionKind::ETodayFallback,
+                CMD_ARCHIVE_DAY,
+                first,
+                last,
+                false,
+            )
             .await
         else {
             return;
@@ -330,8 +537,13 @@ impl Collector {
         let now = Utc::now().timestamp();
         let (target_day, first, last) = day_request_window(now, self.tz);
         let map = match self
-            .connector
-            .request_all(CMD_ARCHIVE_DAY, first, last, false)
+            .request_recorded(
+                TransmissionKind::DayArchive,
+                CMD_ARCHIVE_DAY,
+                first,
+                last,
+                false,
+            )
             .await
         {
             Ok(m) => m,
@@ -353,8 +565,13 @@ impl Collector {
         let now = Utc::now();
         let (first, last) = month_request_window(now.year(), now.month(), self.tz);
         let Ok(map) = self
-            .connector
-            .request_all(CMD_ARCHIVE_MONTH, first, last, false)
+            .request_recorded(
+                TransmissionKind::MonthOffsetProbe,
+                CMD_ARCHIVE_MONTH,
+                first,
+                last,
+                false,
+            )
             .await
         else {
             return;
@@ -388,8 +605,13 @@ impl Collector {
         for _ in 0..months {
             let (first, last) = month_request_window(y, m, self.tz);
             if let Ok(map) = self
-                .connector
-                .request_all(CMD_ARCHIVE_MONTH, first, last, false)
+                .request_recorded(
+                    TransmissionKind::MonthArchive,
+                    CMD_ARCHIVE_MONTH,
+                    first,
+                    last,
+                    false,
+                )
                 .await
             {
                 for (serial, frames) in map {
@@ -420,8 +642,13 @@ impl Collector {
             let (first, last) = event_request_window(y, m);
             for &group in groups {
                 if let Ok(map) = self
-                    .connector
-                    .request_all(event_command(group), first, last, true)
+                    .request_recorded(
+                        TransmissionKind::EventArchive,
+                        event_command(group),
+                        first,
+                        last,
+                        true,
+                    )
                     .await
                 {
                     for (serial, frames) in map {
@@ -444,6 +671,19 @@ impl Collector {
             (y, m) = prev_month(y, m);
         }
     }
+}
+
+/// Outcome of a session step that either succeeded or returned an error.
+fn outcome_of<T>(result: &Result<T>) -> TransmissionOutcome {
+    match result {
+        Ok(_) => TransmissionOutcome::Ok,
+        Err(_) => TransmissionOutcome::Failed,
+    }
+}
+
+/// Elapsed milliseconds, saturating rather than wrapping on a stalled link.
+fn elapsed_ms(clock: Instant) -> u32 {
+    u32::try_from(clock.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
 fn prev_month(y: i32, m: u32) -> (i32, u32) {
@@ -576,6 +816,264 @@ mod tests {
             .expect("the next poll cycle should retry");
         assert_eq!(inverters.len(), 1);
         assert_eq!(state.ended_sessions.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        recorded: std::sync::Mutex<Vec<PollTransmission>>,
+    }
+
+    impl RecordingSink {
+        fn all(&self) -> Vec<PollTransmission> {
+            self.recorded.lock().expect("sink lock").clone()
+        }
+
+        fn kinds(&self) -> Vec<&'static str> {
+            self.all()
+                .iter()
+                .map(|transmission| transmission.kind.as_str())
+                .collect()
+        }
+
+        fn of_kind(&self, kind: &str) -> Vec<PollTransmission> {
+            self.all()
+                .into_iter()
+                .filter(|transmission| transmission.kind.as_str() == kind)
+                .collect()
+        }
+    }
+
+    impl TransmissionSink for RecordingSink {
+        fn record(&self, transmission: PollTransmission) {
+            self.recorded.lock().expect("sink lock").push(transmission);
+        }
+    }
+
+    /// Two devices behind one collector; the first answers with two frames,
+    /// the second with one, so per-serial counts are distinguishable.
+    struct TwoInverterConnector {
+        fail_requests: bool,
+    }
+
+    #[async_trait]
+    impl Connection for TwoInverterConnector {
+        fn communication(
+            &self,
+        ) -> (
+            smalog_observation::ProtocolFamily,
+            smalog_observation::Transport,
+        ) {
+            (
+                smalog_observation::ProtocolFamily::SmaData2Plus,
+                smalog_observation::Transport::Bluetooth,
+            )
+        }
+
+        fn devices(&self) -> Vec<DeviceId> {
+            vec![
+                DeviceId {
+                    susy_id: 1,
+                    serial: 22,
+                    address: "b".into(),
+                },
+                DeviceId {
+                    susy_id: 1,
+                    serial: 11,
+                    address: "a".into(),
+                },
+            ]
+        }
+
+        fn user_group(&self) -> UserGroup {
+            UserGroup::User
+        }
+
+        async fn begin(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn login_all(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn request_all(
+            &mut self,
+            _command: u32,
+            _first: u32,
+            _last: u32,
+            _events: bool,
+        ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+            if self.fail_requests {
+                return Err(Error::Timeout);
+            }
+            Ok(HashMap::from([
+                (11u32, vec![vec![0u8; 8], vec![0u8; 8]]),
+                (22u32, vec![vec![0u8; 8]]),
+            ]))
+        }
+
+        async fn end(&mut self) {}
+
+        async fn set_clock(&mut self, _mode: ClockMode) -> Result<SyncOutcome> {
+            Ok(SyncOutcome::Skipped("disabled in test"))
+        }
+    }
+
+    fn collector_with(connector: TwoInverterConnector) -> (Collector, Arc<RecordingSink>) {
+        let sink = Arc::new(RecordingSink::default());
+        let collector = Collector::with_sink(
+            Box::new(connector),
+            Tz::UTC,
+            PollOptions::default(),
+            sink.clone(),
+        );
+        (collector, sink)
+    }
+
+    #[tokio::test]
+    async fn cycle_records_every_session_step_once() {
+        let (mut collector, sink) = collector_with(TwoInverterConnector {
+            fail_requests: false,
+        });
+
+        collector.cycle(false, None).await.expect("cycle");
+
+        let kinds = sink.kinds();
+        for step in [
+            "session.begin",
+            "session.login",
+            "session.clock_sync",
+            "session.end",
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|kind| **kind == step).count(),
+                1,
+                "expected exactly one {step} entry in {kinds:?}"
+            );
+        }
+        assert_eq!(kinds.first().copied(), Some("session.begin"));
+        assert_eq!(kinds.last().copied(), Some("session.end"));
+    }
+
+    #[tokio::test]
+    async fn skipped_clock_sync_is_recorded_as_ok_with_its_reason() {
+        let (mut collector, sink) = collector_with(TwoInverterConnector {
+            fail_requests: false,
+        });
+
+        collector.cycle(false, None).await.expect("cycle");
+
+        let recorded = sink.of_kind("session.clock_sync");
+        let sync = recorded.first().expect("clock sync entry");
+        assert_eq!(sync.outcome, TransmissionOutcome::Ok);
+        assert_eq!(sync.error, None);
+        assert_eq!(sync.detail.as_deref(), Some("disabled in test"));
+    }
+
+    #[tokio::test]
+    async fn request_records_per_serial_frame_counts() {
+        let (mut collector, sink) = collector_with(TwoInverterConnector {
+            fail_requests: false,
+        });
+
+        collector.cycle(false, None).await.expect("cycle");
+
+        let recorded = sink.of_kind("spot.ac_total_power");
+        let request = recorded.first().expect("ac total power entry");
+        assert_eq!(request.outcome, TransmissionOutcome::Ok);
+        assert_eq!(request.total_frames, 3);
+        assert_eq!(request.frames_by_serial.get(&11), Some(&2));
+        assert_eq!(request.frames_by_serial.get(&22), Some(&1));
+        assert_eq!(request.addressed_serials, vec![11, 22]);
+        assert_eq!(
+            request.command,
+            Some(QueryKind::SpotAcTotalPower.query().command)
+        );
+        assert_eq!(
+            request.first_lri,
+            Some(QueryKind::SpotAcTotalPower.query().first)
+        );
+        assert_eq!(request.error, None);
+    }
+
+    #[tokio::test]
+    async fn failing_request_is_recorded_as_failed_with_its_error() {
+        let (mut collector, sink) = collector_with(TwoInverterConnector {
+            fail_requests: true,
+        });
+
+        collector.cycle(false, None).await.expect("cycle");
+
+        let recorded = sink.of_kind("spot.ac_total_power");
+        let request = recorded.first().expect("ac total power entry");
+        assert_eq!(request.outcome, TransmissionOutcome::Failed);
+        assert_eq!(request.total_frames, 0);
+        assert!(request.frames_by_serial.is_empty());
+        assert_eq!(request.error, Some(Error::Timeout.to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_answered_by_nobody_is_recorded_as_empty() {
+        let sink = Arc::new(RecordingSink::default());
+        let state = Arc::new(FlakyState::default());
+        state.login_attempts.store(1, Ordering::SeqCst);
+        let mut collector = Collector::with_sink(
+            Box::new(FlakyLoginConnector { state }),
+            Tz::UTC,
+            PollOptions::default(),
+            sink.clone(),
+        );
+
+        collector.cycle(false, None).await.expect("cycle");
+
+        let recorded = sink.of_kind("spot.ac_total_power");
+        let request = recorded.first().expect("ac total power entry");
+        assert_eq!(request.outcome, TransmissionOutcome::Empty);
+        assert_eq!(request.total_frames, 0);
+        assert_eq!(request.error, None);
+    }
+
+    #[tokio::test]
+    async fn failed_login_records_the_login_step_and_no_data_request() {
+        let sink = Arc::new(RecordingSink::default());
+        let mut collector = Collector::with_sink(
+            Box::new(FlakyLoginConnector {
+                state: Arc::new(FlakyState::default()),
+            }),
+            Tz::UTC,
+            PollOptions::default(),
+            sink.clone(),
+        );
+
+        assert!(matches!(
+            collector.cycle(false, None).await,
+            Err(Error::Timeout)
+        ));
+
+        let kinds = sink.kinds();
+        assert_eq!(kinds, vec!["session.begin", "session.login", "session.end"]);
+        let recorded = sink.of_kind("session.login");
+        let login = recorded.first().expect("login entry");
+        assert_eq!(login.outcome, TransmissionOutcome::Failed);
+        assert_eq!(login.error, Some(Error::Timeout.to_string()));
+    }
+
+    #[tokio::test]
+    async fn no_sink_records_nothing_and_keeps_the_cycle_intact() {
+        let state = Arc::new(FlakyState::default());
+        state.login_attempts.store(1, Ordering::SeqCst);
+        let mut collector = Collector::new(
+            Box::new(FlakyLoginConnector {
+                state: state.clone(),
+            }),
+            Tz::UTC,
+            PollOptions::default(),
+        );
+
+        let inverters = collector.cycle(false, None).await.expect("cycle");
+
+        assert_eq!(inverters.len(), 1);
+        assert_eq!(state.requests.load(Ordering::SeqCst), 13);
     }
 
     #[tokio::test]

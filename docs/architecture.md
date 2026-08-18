@@ -156,13 +156,32 @@ capabilities instead of being exposed as non-functional adapters.
 Presentation layers resolve those identifiers through `smalog-tags`, keeping
 locale state out of persistence and connection results.
 
+### The transmission diagnostics channel
+
+`smalog-connection::transmission` is the one documented exception to
+"protocol sentinels do not cross into runtime presentation". A
+`PollTransmission` describes one exchange — SMA command, requested LRI window,
+duration, per-serial frame counts, outcome — because that is exactly what an
+operator needs to compare against SBFspot behaviour or SMA documentation. It
+is therefore *not* protocol-neutral, which is why it lives in the connection
+crate rather than in `smalog-observation`.
+
+The exception is bounded three ways. It carries metadata only, never frame
+payloads. It reaches storage as storage-owned row types mapped by the app at
+its own boundary, so `smalog-storage` still depends only on
+`smalog-observation`. And storage, CSV and MQTT keep consuming
+`PollCycleObservation` alone — the channel is operator-facing diagnostics, not
+a second data path.
+
 ## The `smalog` app
 
 | Module | Responsibility |
 |---|---|
 | [`service`](../src/crates/smalog/src/service.rs) | The loop: aligned ticks, daylight gating, persistence/export orchestration, and the `/healthz` + `/status` + `/api/*` HTTP server. |
 | [`config`](../src/crates/smalog/src/config.rs) | TOML config with `${ENV_VAR}` expansion + validation; builds connector params. |
-| [`smalog-storage`](../src/crates/smalog-storage/src/lib.rs) | Canonical domain model, sqlx storage, schema migrations, rollups and indexed API queries. |
+| [`smalog-storage`](../src/crates/smalog-storage/src/lib.rs) | Canonical domain model, sqlx storage, schema migrations, rollups and indexed API queries; plus the optional transmission ring. |
+| [`diagnostics`](../src/crates/smalog/src/diagnostics.rs) | Bounded write queue, background writer and pruner for the persisted transmission ring; the poll loop never waits on a database. |
+| [`applog`](../src/crates/smalog/src/applog.rs) | `tracing` layer capturing the service's own log into a bounded in-memory ring, and that ring's read model. The log is never persisted: a database write behind every log call would be the wrong trade for disposable data. |
 | [`smalog-sbfspot-migrator`](../src/crates/smalog-sbfspot-migrator/src/lib.rs) | SBFspot preflight, mapping, bounded/resumable migration and verification. |
 | [`smalog-schema-benchmark`](../src/crates/smalog-schema-benchmark/src/main.rs) | Deterministic schema-v1 capacity loading and query-plan benchmark. |
 | [`daylight`](../src/crates/smalog/src/daylight.rs) | Sunrise/sunset (Lammi) for the daylight gate. |
@@ -199,6 +218,9 @@ When `service.listen` is set, an **axum** server (with a permissive
 - `GET /api/history?range=…&serial=…&strings=…` — a labelled multi-series
   dataset: aggregate (all inverters), one inverter, or per-string DC power
   (day view). 5-minute power for `day`, per-day/per-month yield otherwise.
+- `GET /api/transmissions?…` and `GET /api/logs?…` — keyset pages of the
+  runtime-diagnostics rings, newest first, with `since`/`before` cursors and
+  index-backed filters. See [ui.md](ui.md).
 
 The [React/shadcn UI](../src/ui/) in `src/ui` consumes these. Built for
 release, its `dist/` is **embedded into the binary** (`rust-embed`, behind

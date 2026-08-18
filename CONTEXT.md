@@ -33,6 +33,19 @@ SMA Data V1 has separate non-operational boundaries for RS232, RS485 and
 Powerline. Ethernet datagrams, Bluetooth frames, SMA commands, fragments and
 protocol sentinels do not cross into storage, export or runtime presentation.
 
+## Poll Transmission
+
+A **Poll Transmission** is one recorded exchange within a Poll Cycle: a data
+request or a session step, with its SMA command, requested register window,
+duration, per-serial response frame counts and outcome.
+
+It is the one deliberate exception to the rule above. Naming SMA commands is
+the point of it — an operator diagnosing a silent inverter needs to see which
+request went unanswered — so it is protocol-facing by design and stays out of
+the canonical observation model. The exception is bounded: a Poll Transmission
+carries metadata only and never frame payloads, and storage, export and the
+canonical read paths continue to see only the Poll Cycle result.
+
 ## Daily Archive
 
 A **Daily Archive** is the month, event, and related historical data fetched

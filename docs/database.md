@@ -129,10 +129,60 @@ version when enabled:
 |---|---|---|
 | `inverter_daily_statistics` | PK `(inverter_id, statistics_date)`; index `(statistics_date, inverter_id)` | Rebuildable cache of peak/mean AC/DC power, actual/expected sample counts, coverage timestamps, completeness, calculation time, and source watermark. Normal production/yield results never depend on it. Enabled by `database.daily_statistics = true` or migration `--daily-statistics`. |
 | `pvoutput_exports` | PK `(inverter_id, measured_at)` | Optional imported export state (`exported_at`, `attempts`, `last_error`). Created only by migration with `--pvoutput-state legacy-flag`. smalog provides no PVOutput uploader or writable compatibility adapter. |
+| `poll_transmissions` | PK `transmission_id` (autoincrement/identity); indexes `(occurred_at)`, `(outcome, transmission_id DESC)`, `(target, transmission_id DESC)` | One row per inverter exchange: occurred-at (epoch **milliseconds**), collector target, transport, protocol, request kind, SMA command, LRI window, duration, total frames, outcome (`ok`/`empty`/`failed`), error, detail. Metadata only — never frame payloads. |
+| `poll_transmission_devices` | PK `(transmission_id, serial_number)` with `ON DELETE CASCADE`; index `(serial_number, transmission_id DESC)` | One row per serial an exchange addressed or that answered it, with its frame count. |
 
 Dropping the daily-statistics component cannot remove authoritative
 measurements or daily yields. The PVOutput option performs a one-time import;
 it is not a runtime bridge for `SBFspotUploadDaemon`.
+
+### The transmission ring
+
+The two diagnostics tables are created together, keyed by
+`diagnostics_version` in `schema_metadata`, the first time the service starts
+with `service.transmission_log_retention_hours` above `0`. Enabling them does
+**not** change `SCHEMA_VERSION`: they are additive, and a database whose owner
+never enables them is byte-for-byte what it was.
+
+The service's own log is deliberately **not** stored. It lives in a
+process-memory ring owned by the application, because a log line is cheap to
+emit and expensive to store, and persisting one would put a database write
+behind every `tracing` call. See [operations](operations.md#logging).
+
+They behave as a ring, pruned by the service after each batch it writes:
+
+- rows older than `service.*_retention_hours` (48 h by default) are deleted,
+  with the age measured against the newest stored row rather than a fresh
+  clock reading, so a host whose clock has not been set yet does not delete
+  its own history;
+- rows beyond `service.*_max_entries` are deleted oldest-first, even inside
+  the window;
+- both deletes run in bounded chunks, so a large backlog cannot hold one long
+  write lock.
+
+Setting the retention to `0` stops recording but **never** drops rows or
+tables: deleting stored history stays an explicit action. At the default cap
+the tables cost about 20 MB on SQLite and 48 MB on PostgreSQL, indexes
+included.
+
+Reads are keyset-paged, never offset-paged:
+
+```sql
+SELECT * FROM poll_transmissions
+WHERE transmission_id < :cursor          -- omit to start at the newest
+ORDER BY transmission_id DESC
+LIMIT 100;
+```
+
+The cursor is the primary key, which keeps increasing across restarts and
+across the constant deletes pruning performs — a recomputed or reused key
+would make the dashboard skip or repeat entries. Because the page cost is an
+index seek plus its rows, paging to the oldest entry of a two-day window costs
+the same as reading the newest page. Every supported filter has an index so
+that a filter matching almost nothing does not degrade into a backwards scan;
+[`smalog-schema-benchmark`](../src/crates/smalog-schema-benchmark/) measures
+each of them at the row cap against a one-second budget and fails the run when
+a case regresses.
 
 ## Indexes and access paths
 

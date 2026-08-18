@@ -30,6 +30,35 @@ calc_missing_spot = false
 # available" (SBFspot never queries these at all).
 poll_consumption = false
 
+# --- Runtime diagnostics (System area of the web dashboard) ---
+# Every request the poll cycle sends to an inverter, and the service's own
+# log, are shown under System. Both behave as a ring: entries older than the
+# retention window are dropped automatically.
+#
+# They are kept in different places, on purpose:
+#   - transmissions are stored in the database and SURVIVE a restart, so the
+#     exchanges leading up to a crash are still there afterwards;
+#   - the application log is kept in process MEMORY only and is LOST on
+#     restart. A log line is cheap to write and expensive to store, and
+#     persisting one would put a database write behind every log call. The
+#     journal or container log remains the durable copy.
+#
+# Hours to keep. 0 switches the respective ring off. For transmissions, rows
+# already stored are left alone (drop them deliberately, they are never
+# deleted on your behalf); 0 for the log keeps log content out of the
+# database entirely — where it never goes in the first place.
+transmission_log_retention_hours = 48
+application_log_retention_hours = 48
+# Entry caps, the second bound. The retention window is the primary one;
+# these keep the ring bounded when the window alone would not — a short poll
+# interval, many collectors, or a verbose [log] level. At these defaults the
+# transmission tables stay near 20 MB on SQLite (48 MB on PostgreSQL) and the
+# in-memory log ring near 12 MB of RSS.
+# Note that a cap reached before the window elapses shortens the visible
+# history; the dashboard states the window it is actually showing.
+transmission_log_max_entries = 50000
+application_log_max_entries = 50000
+
 [plant]
 name = "MyPlant"
 # Decimal degrees. Used to gate polling to daylight hours. Set both to

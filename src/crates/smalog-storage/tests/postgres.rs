@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::NaiveDate;
 use chrono_tz::{Europe::Berlin, Tz};
+use smalog_storage::diagnostics::{TransmissionDeviceRow, TransmissionFilter, TransmissionRow};
 use smalog_storage::domain::{
     BatteryMeasurement, CanonicalText, InverterEnergySample, InverterIdentity, InverterMeasurement,
     MilliCelsius, MilliVolts, Milliamperes, MpptMeasurement, Permille, SiteConsumptionMeasurement,
@@ -1395,6 +1396,173 @@ async fn postgres_latest_reads_use_one_bounded_index_lookup_per_inverter() {
         assert!(
             plan.contains("inverter_measurements_inverter_time_uq"),
             "{plan}"
+        );
+    }
+
+    cleanup(admin, pool, schema_name).await;
+}
+
+fn diagnostic_transmission(occurred_at_ms: i64, target: &str, outcome: &str) -> TransmissionRow {
+    TransmissionRow {
+        occurred_at_ms,
+        target: target.to_owned(),
+        transport: "ethernet".to_owned(),
+        protocol: "sma_data_2_plus".to_owned(),
+        request_kind: "spot.ac_power".to_owned(),
+        command: Some(0x5100_0200),
+        first_lri: Some(0x0046_4000),
+        last_lri: Some(0x0046_42FF),
+        duration_ms: 42,
+        total_frames: 2,
+        outcome: outcome.to_owned(),
+        error: (outcome == "failed").then(|| "timeout".to_owned()),
+        detail: None,
+        devices: vec![TransmissionDeviceRow {
+            serial_number: 11,
+            frame_count: 2,
+            addressed: true,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn postgres_transmission_ring_writes_reads_and_prunes() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let (admin, pool, schema_name) = isolated_pool(&url).await;
+    schema::initialize_postgres(&pool).await.unwrap();
+    schema::enable_postgres_diagnostics(&pool).await.unwrap();
+    let db = Db::Postgres {
+        pool: pool.clone(),
+        timezone: Tz::UTC,
+        statistics_poll_interval_s: None,
+    };
+
+    let hour_ms = 3_600_000i64;
+    let now = 100 * hour_ms;
+    db.write_transmissions(&[
+        diagnostic_transmission(now - 50 * hour_ms, "eth", "ok"),
+        diagnostic_transmission(now - 1, "eth", "failed"),
+        diagnostic_transmission(now, "bt", "ok"),
+    ])
+    .await
+    .unwrap();
+    // Newest first, with the device rows attached.
+    let entries = db
+        .read_transmissions(&TransmissionFilter {
+            limit: 10,
+            ..TransmissionFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].row.target, "bt");
+    assert_eq!(entries[0].row.devices.len(), 1);
+    assert_eq!(entries[0].row.devices[0].frame_count, 2);
+
+    // Each filter is pushed into SQL.
+    let failed = db
+        .read_transmissions(&TransmissionFilter {
+            limit: 10,
+            outcome: Some("failed".to_owned()),
+            ..TransmissionFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    let by_serial = db
+        .read_transmissions(&TransmissionFilter {
+            limit: 10,
+            serial: Some(11),
+            ..TransmissionFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(by_serial.len(), 3);
+
+    // Age pruning removes the row past the window and cascades its devices.
+    db.prune_transmissions(std::time::Duration::from_secs(48 * 3_600), 50_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.diagnostics_stats().await.unwrap().transmissions.retained,
+        2
+    );
+    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM poll_transmission_devices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(devices, 2);
+
+    // The row cap prunes inside the window.
+    db.prune_transmissions(std::time::Duration::from_secs(48 * 3_600), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.diagnostics_stats().await.unwrap().transmissions.retained,
+        1
+    );
+
+    cleanup(admin, pool, schema_name).await;
+}
+
+/// The one-second read budget rests on these plans staying index seeks; a
+/// dropped or reordered index would turn a selective filter into a scan of
+/// the whole ring.
+#[tokio::test]
+async fn postgres_diagnostics_reads_use_their_indexes() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let (admin, pool, schema_name) = isolated_pool(&url).await;
+    schema::initialize_postgres(&pool).await.unwrap();
+    schema::enable_postgres_diagnostics(&pool).await.unwrap();
+    let db = Db::Postgres {
+        pool: pool.clone(),
+        timezone: Tz::UTC,
+        statistics_poll_interval_s: None,
+    };
+
+    let rows: Vec<TransmissionRow> = (0..2_000)
+        .map(|i| diagnostic_transmission(1_000 + i64::from(i), "eth", "ok"))
+        .collect();
+    db.write_transmissions(&rows).await.unwrap();
+    sqlx::raw_sql("ANALYZE poll_transmissions; ANALYZE poll_transmission_devices;")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (label, sql) in [
+        (
+            "outcome",
+            "EXPLAIN SELECT transmission_id FROM poll_transmissions
+             WHERE outcome = 'failed' ORDER BY transmission_id DESC LIMIT 100",
+        ),
+        (
+            "target",
+            "EXPLAIN SELECT transmission_id FROM poll_transmissions
+             WHERE target = 'eth' ORDER BY transmission_id DESC LIMIT 100",
+        ),
+        (
+            "serial",
+            "EXPLAIN SELECT t.transmission_id FROM poll_transmissions AS t
+             JOIN poll_transmission_devices AS d
+               ON d.transmission_id = t.transmission_id AND d.serial_number = 11
+             ORDER BY t.transmission_id DESC LIMIT 100",
+        ),
+    ] {
+        let plan = sqlx::query(sql)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("Index") && !plan.contains("Seq Scan"),
+            "{label} read should be index-backed: {plan}"
         );
     }
 

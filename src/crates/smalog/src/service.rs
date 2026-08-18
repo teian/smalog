@@ -199,7 +199,7 @@ impl Service {
                     error!(error = %e, "http server failed");
                 }
             });
-            info!(%addr, "http endpoint listening (/healthz, /status, /api/*)");
+            log_http_endpoints(addr);
         }
 
         let interval = self.config.service.interval;
@@ -562,6 +562,41 @@ struct HistoryPeriod {
     week: Option<NaiveDate>,
     month: Option<NaiveDate>,
     year: Option<i32>,
+}
+
+/// Base URL a browser on this machine can open for `addr`.
+///
+/// A wildcard bind (`0.0.0.0`, `::`) is not routable, so it is reported as the
+/// matching loopback address; IPv6 hosts are bracketed as URL authorities
+/// require. The result never has a trailing slash.
+fn browsable_base_url(addr: std::net::SocketAddr) -> String {
+    let ip = addr.ip();
+    let host = match ip {
+        std::net::IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => "[::1]".to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    format!("http://{host}:{}", addr.port())
+}
+
+/// Log the HTTP endpoints as full URLs, which terminals render as clickable
+/// links. The dashboard is only served when built `--features ui`; without it
+/// the Vite dev server (`pnpm run dev`) proxies `/api` to this port instead.
+fn log_http_endpoints(addr: std::net::SocketAddr) {
+    let base = browsable_base_url(addr);
+    info!(%addr, "http endpoint listening");
+    if cfg!(feature = "ui") {
+        info!(url = %format!("{base}/"), "dashboard");
+    } else {
+        info!(
+            url = %format!("{base}/api/status"),
+            "dashboard not embedded (build with --features ui); \
+             run `pnpm run dev` in src/ui and open http://localhost:5173"
+        );
+    }
+    info!(url = %format!("{base}/status"), "status");
+    info!(url = %format!("{base}/healthz"), "health");
 }
 
 /// The HTTP server (axum): health, live status, history and inverter list;
@@ -1706,13 +1741,82 @@ mod tests {
     };
 
     use super::{
-        build_day_metric_rows, build_day_summary, build_month_summary, build_week_summary,
+        browsable_base_url, build_day_metric_rows, build_day_summary, build_month_summary, build_week_summary,
         build_year_summary, complete_year_buckets, diagnostic_efficiency, diagnostics_handler,
         history_handler, inverter_target, merge_inverter_day_rows, parse_history_date,
         parse_history_month, parse_history_week, parse_history_year, previous_month_comparison_end,
         previous_week_comparison_end, previous_year_comparison_end, week_start, ApiState,
         DiagnosticsParams, HistoryParams, Service, Status,
     };
+    use super::log_http_endpoints;
+
+    #[test]
+    fn wildcard_binds_are_reported_as_loopback() {
+        assert_eq!(
+            browsable_base_url("0.0.0.0:8080".parse().unwrap()),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            browsable_base_url("[::]:8080".parse().unwrap()),
+            "http://[::1]:8080"
+        );
+    }
+
+    #[test]
+    fn endpoint_log_renders_openable_urls() {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_http_endpoints("0.0.0.0:8080".parse().unwrap())
+        });
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+
+        assert!(
+            logged.contains("url=http://127.0.0.1:8080/healthz"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("url=http://127.0.0.1:8080/status"),
+            "{logged}"
+        );
+        assert!(!logged.contains("http://0.0.0.0:8080"), "{logged}");
+        let ui_url = if cfg!(feature = "ui") {
+            "url=http://127.0.0.1:8080/"
+        } else {
+            "url=http://127.0.0.1:8080/api/status"
+        };
+        assert!(logged.contains(ui_url), "{logged}");
+    }
+
+    #[test]
+    fn concrete_binds_keep_their_address() {
+        assert_eq!(
+            browsable_base_url("192.168.1.50:9000".parse().unwrap()),
+            "http://192.168.1.50:9000"
+        );
+        assert_eq!(
+            browsable_base_url("[fe80::1]:9000".parse().unwrap()),
+            "http://[fe80::1]:9000"
+        );
+    }
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()

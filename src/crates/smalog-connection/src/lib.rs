@@ -16,6 +16,9 @@
 //! - [`collector`] — one [`Collector`] that drives any `Connection` through
 //!   the SBFspot poll sequence and returns
 //!   [`smadata2::inverter::InverterData`].
+//! - [`transmission`] — the protocol-facing diagnostics channel describing
+//!   each exchange a Poll Cycle performs. Operator-facing only; storage and
+//!   export keep consuming canonical observations.
 //!
 //! Bluetooth replies are normalized to the Speedwire datagram layout, so
 //! [`smadata2::decode`] and [`smadata2::archive`] are shared by all
@@ -31,6 +34,7 @@ mod observation;
 pub mod smadata1;
 pub mod smadata2;
 pub mod speedwire;
+pub mod transmission;
 
 pub use bluetooth::{BluetoothConnection, BluetoothParams, BtSocket};
 pub use collector::{Collector, PollOptions};
@@ -43,3 +47,4 @@ pub use smadata1::rs232::{Rs232Connection, Rs232Params};
 pub use smadata1::rs485::{Rs485Connection, Rs485Params};
 pub use smadata1::{SmaData1Connection, SmaData1Medium};
 pub use speedwire::{SpeedwireConnection, SpeedwireInverterSpec};
+pub use transmission::{PollTransmission, TransmissionKind, TransmissionOutcome, TransmissionSink};

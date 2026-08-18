@@ -362,3 +362,44 @@ fn rejects_duplicate_bluetooth_addresses() {
     );
     assert!(Config::parse(&toml).is_err());
 }
+
+#[test]
+fn diagnostics_retention_defaults_to_two_days() {
+    let cfg = Config::parse(MINIMAL).expect("valid");
+    assert_eq!(cfg.service.transmission_log_retention_hours, 48);
+    assert_eq!(cfg.service.application_log_retention_hours, 48);
+    assert_eq!(cfg.service.transmission_log_max_entries, 50_000);
+    assert_eq!(cfg.service.application_log_max_entries, 50_000);
+}
+
+#[test]
+fn diagnostics_retention_can_be_configured_and_disabled() {
+    let toml = format!(
+        "{MINIMAL}\n[service]\ntransmission_log_retention_hours = 0\n\
+         application_log_retention_hours = 12\ntransmission_log_max_entries = 250000\n\
+         application_log_max_entries = 1\n"
+    );
+    let cfg = Config::parse(&toml).expect("valid");
+    assert_eq!(cfg.service.transmission_log_retention_hours, 0);
+    assert_eq!(cfg.service.application_log_retention_hours, 12);
+    assert_eq!(cfg.service.transmission_log_max_entries, 250_000);
+    assert_eq!(cfg.service.application_log_max_entries, 1);
+}
+
+#[test]
+fn rejects_out_of_range_diagnostics_settings() {
+    for (key, value) in [
+        ("transmission_log_retention_hours", "8761"),
+        ("application_log_retention_hours", "100000"),
+        // Zero rows is not a second way to disable recording — retention is.
+        ("transmission_log_max_entries", "0"),
+        ("application_log_max_entries", "1000001"),
+    ] {
+        let toml = format!("{MINIMAL}\n[service]\n{key} = {value}\n");
+        let error = Config::parse(&toml).expect_err("out of range");
+        assert!(
+            error.to_string().contains(key),
+            "error should name {key}: {error}"
+        );
+    }
+}

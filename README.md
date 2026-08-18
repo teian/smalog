@@ -38,7 +38,11 @@ migrator.
   `/status` HTTP endpoints.
 - **Web dashboard** — an optional React/shadcn UI ([src/ui](src/ui/))
   showing live and historic (day/week/month/year) production via a small
-  `/api/*` JSON API. See [docs/ui.md](docs/ui.md).
+  `/api/*` JSON API. Its **System** area shows every request the poll cycle
+  sends to an inverter — stored, so it survives a restart — and the service's
+  own log from an in-memory ring, both covering two days, so a silent inverter
+  can be diagnosed without shell access to the host. See
+  [docs/ui.md](docs/ui.md).
 - **Config in TOML** with `${ENV_VAR}` expansion so secrets stay out of
   the file.
 
@@ -453,19 +457,29 @@ $EDITOR config.toml
 
 For development, point the database at a workspace-local file, for
 example `url = "sqlite://data/smalog.db"`, and keep
-`listen = "0.0.0.0:8080"`. Export every `${VAR}` the file references,
-then run a debug build:
+`listen = "0.0.0.0:8080"`.
+
+Every `${VAR}` the file references must be exported before startup — an
+unset variable is a hard error, and the names depend on what you kept in
+your own config, not on the example. List them, then export each one:
 
 ```bash
+grep -o '\${[A-Z0-9_]*}' config.toml | sort -u
 export SMALOG_INV1_PASSWORD='0000'
+```
 
+Validate the result, then run a debug build:
+
+```bash
+cargo run -p smalog -- --config config.toml check-config
 cargo run -p smalog -- --config config.toml run
 ```
 
 `--config` is required because the default path is
-`/etc/smalog/config.toml`. During iteration, `once` performs a single
-poll cycle and exits, and `check-config` validates configuration edits
-(see [CLI](#cli)).
+`/etc/smalog/config.toml`. `check-config` reports a missing variable the
+same way `run` does, so it is the quickest way to confirm the
+environment before a poll. During iteration, `once` performs a single
+poll cycle and exits (see [CLI](#cli)).
 
 ### Web dashboard
 

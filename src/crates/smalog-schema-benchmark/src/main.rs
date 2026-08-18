@@ -57,6 +57,14 @@ struct Args {
     /// Skip loading and benchmark an already loaded target.
     #[arg(long)]
     benchmark_only: bool,
+    /// Rows to load into the transmission ring; the default is the shipped
+    /// row cap, so the read budget is measured at full retention.
+    #[arg(long, default_value_t = 50_000)]
+    diagnostics_rows: u64,
+    /// Read budget in milliseconds. A slower case fails the run rather than
+    /// being reported and ignored.
+    #[arg(long, default_value_t = 1_000)]
+    read_budget_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +119,8 @@ struct ReportArgs {
     inverters: u32,
     layout: Layout,
     batch_rows: usize,
+    diagnostics_rows: u64,
+    read_budget_ms: u64,
 }
 
 fn formula(args: &Args) -> Result<Formula> {
@@ -481,6 +491,253 @@ async fn load_daily_postgres(
     Ok(())
 }
 
+/// Fill the transmission ring to `rows`, so the read budget is measured at
+/// the row cap rather than on an empty table.
+///
+/// The shapes mirror what the service writes: one device row per
+/// transmission, one rare `failed` outcome so the selective-filter case has
+/// something to find, and two collector targets.
+macro_rules! load_diagnostics_body {
+    ($pool:expr, $rows:expr, $batch:expr) => {{
+        let pool = $pool;
+        let rows: u64 = $rows;
+        let batch: u64 = $batch as u64;
+        let started = Instant::now();
+        for chunk_start in (0..rows).step_by(batch as usize) {
+            let chunk_end = (chunk_start + batch).min(rows);
+            let mut tx = pool.begin().await?;
+            let mut transmissions = QueryBuilder::new(
+                "INSERT INTO poll_transmissions
+                 (transmission_id,occurred_at,target,transport,protocol,request_kind,
+                  command,first_lri,last_lri,duration_ms,total_frames,outcome,error,detail)
+                 ",
+            );
+            transmissions.push_values(chunk_start..chunk_end, |mut row, i| {
+                // One failure in every thousand entries: the case the budget
+                // exists for is a filter that matches almost nothing.
+                let failed = i % 1_000 == 0;
+                row.push_bind(i as i64 + 1)
+                    .push_bind(1_700_000_000_000i64 + i as i64)
+                    .push_bind(if i % 2 == 0 {
+                        "192.168.1.20"
+                    } else {
+                        "00:80:25:AB:CD:EF"
+                    })
+                    .push_bind("ethernet")
+                    .push_bind("sma_data_2_plus")
+                    .push_bind("spot.ac_power")
+                    .push_bind(0x5100_0200i64)
+                    .push_bind(0x0046_4000i64)
+                    .push_bind(0x0046_42FFi64)
+                    .push_bind(40i64 + (i % 20) as i64)
+                    .push_bind(if failed { 0i64 } else { 2i64 })
+                    .push_bind(if failed { "failed" } else { "ok" })
+                    .push_bind(if failed { Some("timeout") } else { None })
+                    .push_bind(Option::<&str>::None);
+            });
+            transmissions.build().execute(&mut *tx).await?;
+
+            let mut devices = QueryBuilder::new(
+                "INSERT INTO poll_transmission_devices
+                 (transmission_id,serial_number,frame_count,addressed) ",
+            );
+            devices.push_values(chunk_start..chunk_end, |mut row, i| {
+                // One rare serial among common ones: a filter that matches
+                // almost nothing is the case the index has to survive.
+                let serial = if i % 500 == 0 { 9 } else { i % 4 };
+                row.push_bind(i as i64 + 1)
+                    .push_bind(1_000_000i64 + serial as i64)
+                    .push_bind(2i64)
+                    .push_bind(1i16);
+            });
+            devices.build().execute(&mut *tx).await?;
+
+            tx.commit().await?;
+        }
+        timing("diagnostics", rows * 2, started)
+    }};
+}
+
+/// Read cases for the two diagnostics endpoints, covering every request shape
+/// the API supports.
+///
+/// `before` deliberately starts at the oldest end of the ring: keyset paging
+/// must cost the same there as at the newest end, which offset paging would
+/// not.
+fn diagnostics_read_queries(rows: u64) -> Vec<(&'static str, String)> {
+    let newest = rows as i64;
+    let oldest_page = 101i64;
+    vec![
+        (
+            "diag_transmissions_page",
+            "SELECT * FROM poll_transmissions ORDER BY transmission_id DESC LIMIT 100".into(),
+        ),
+        (
+            "diag_transmissions_since_tail",
+            format!(
+                "SELECT * FROM poll_transmissions WHERE transmission_id > {}
+                 ORDER BY transmission_id DESC LIMIT 100",
+                newest - 10
+            ),
+        ),
+        (
+            "diag_transmissions_before_oldest",
+            format!(
+                "SELECT * FROM poll_transmissions WHERE transmission_id < {oldest_page}
+                 ORDER BY transmission_id DESC LIMIT 100"
+            ),
+        ),
+        (
+            "diag_transmissions_selective_outcome",
+            "SELECT * FROM poll_transmissions WHERE outcome = 'failed'
+             ORDER BY transmission_id DESC LIMIT 100"
+                .into(),
+        ),
+        (
+            "diag_transmissions_target",
+            "SELECT * FROM poll_transmissions WHERE target = '00:80:25:AB:CD:EF'
+             ORDER BY transmission_id DESC LIMIT 100"
+                .into(),
+        ),
+        (
+            "diag_transmissions_serial_join",
+            "SELECT t.* FROM poll_transmissions AS t
+             JOIN poll_transmission_devices AS d
+               ON d.transmission_id = t.transmission_id AND d.serial_number = 1000009
+             ORDER BY t.transmission_id DESC LIMIT 100"
+                .into(),
+        ),
+        (
+            "diag_transmissions_devices_page",
+            format!(
+                "SELECT * FROM poll_transmission_devices
+                 WHERE transmission_id > {} ORDER BY transmission_id DESC",
+                newest - 100
+            ),
+        ),
+        (
+            "diag_stats",
+            "SELECT COUNT(*), MIN(occurred_at) FROM poll_transmissions".into(),
+        ),
+    ]
+}
+
+/// Run every diagnostics read once more while a prune chunk is in flight.
+///
+/// Pruning deletes constantly in normal operation, so the read budget has to
+/// hold while it runs — not only on a quiet table. Each read is paired with
+/// one chunked delete so the overlap is guaranteed rather than hoped for.
+macro_rules! benchmark_under_prune_body {
+    ($pool:expr, $rows:expr, $explain:expr, $plan_column:expr) => {{
+        let pool = $pool;
+        let mut results: Vec<ReadResult> = Vec::new();
+        for (name, sql) in diagnostics_read_queries($rows) {
+            let prune = {
+                let pool = pool.clone();
+                async move {
+                    sqlx::query(
+                        "DELETE FROM poll_transmissions WHERE transmission_id IN (
+                             SELECT transmission_id FROM poll_transmissions
+                             ORDER BY transmission_id LIMIT 5000
+                         )",
+                    )
+                    .execute(&pool)
+                    .await
+                }
+            };
+            let read = {
+                let pool = pool.clone();
+                let sql = sql.clone();
+                async move {
+                    let started = Instant::now();
+                    let rows = sqlx::query(&sql).fetch_all(&pool).await;
+                    (started.elapsed().as_secs_f64() * 1_000.0, rows)
+                }
+            };
+            let (pruned, (elapsed_ms, rows)) = tokio::join!(prune, read);
+            pruned?;
+            let rows = rows?;
+            let explain = format!("{} {sql}", $explain);
+            let plan = sqlx::query(&explain)
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|row| row.get::<String, _>($plan_column))
+                .collect();
+            results.push(ReadResult {
+                name: format!("{name}_under_prune"),
+                returned_rows: rows.len() as u64,
+                elapsed_ms,
+                plan,
+            });
+        }
+        results
+    }};
+}
+
+/// Whether a diagnostics read must be served without a full table scan.
+///
+/// Unfiltered pages are deliberately excluded: `ORDER BY id DESC LIMIT 100`
+/// walks the primary key backwards and stops at the limit, which both engines
+/// still report as a scan even though it reads a hundred rows, not the ring.
+/// What needs guarding is a filter matching almost nothing, where a missing
+/// index turns the read into a full backwards scan of the whole ring.
+///
+/// Which index is used is left to the planner: PostgreSQL legitimately serves
+/// the serial join from the device primary key instead of the serial index,
+/// and pinning a name would fail a plan that is index-backed and fast.
+fn must_avoid_full_scan(case: &str) -> bool {
+    let case = case.strip_suffix("_under_prune").unwrap_or(case);
+    matches!(
+        case,
+        "diag_transmissions_selective_outcome"
+            | "diag_transmissions_target"
+            | "diag_transmissions_serial_join"
+    )
+}
+
+/// Whether a plan reads one of the ring tables end to end.
+fn plan_has_full_scan(plan: &str) -> bool {
+    // SQLite writes "SEARCH … USING INDEX …" when it seeks and a bare
+    // "SCAN <table>" when it does not; PostgreSQL writes "Seq Scan".
+    plan.contains("Seq Scan")
+        || ["poll_transmissions", "poll_transmission_devices"]
+            .iter()
+            .any(|table| plan.contains(&format!("SCAN {table}")))
+}
+
+/// Fail the run when a read is over budget, or when a selective read stopped
+/// using its index.
+///
+/// A budget that is only reported is a budget nobody notices breaking.
+fn check_read_budget(results: &[ReadResult], budget_ms: u64) -> Result<()> {
+    let mut failures = Vec::new();
+    for result in results.iter().filter(|r| r.name.starts_with("diag_")) {
+        if result.elapsed_ms > budget_ms as f64 {
+            failures.push(format!(
+                "{} took {:.1} ms (budget {budget_ms} ms)",
+                result.name, result.elapsed_ms
+            ));
+        }
+        if must_avoid_full_scan(&result.name) {
+            let plan = result.plan.join(" ");
+            if plan_has_full_scan(&plan) {
+                failures.push(format!(
+                    "{} now scans the ring instead of seeking an index: {plan}",
+                    result.name
+                ));
+            }
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "diagnostics read budget violated:\n  {}",
+        failures.join("\n  ")
+    )
+}
+
 fn read_queries(f: &Formula, interval: u32) -> Vec<(&'static str, String)> {
     let end = timestamp_at(f.samples_per_inverter, interval);
     let end_date = NaiveDate::parse_from_str(&f.end, "%Y-%m-%d").unwrap();
@@ -548,13 +805,25 @@ fn read_queries(f: &Formula, interval: u32) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Canonical read cases plus the diagnostics ones.
+fn all_read_queries(
+    f: &Formula,
+    interval: u32,
+    diagnostics_rows: u64,
+) -> Vec<(&'static str, String)> {
+    let mut queries = read_queries(f, interval);
+    queries.extend(diagnostics_read_queries(diagnostics_rows));
+    queries
+}
+
 async fn benchmark_sqlite(
     pool: &SqlitePool,
     f: &Formula,
     interval: u32,
+    diagnostics_rows: u64,
 ) -> Result<Vec<ReadResult>> {
     let mut results = Vec::new();
-    for (name, sql) in read_queries(f, interval) {
+    for (name, sql) in all_read_queries(f, interval, diagnostics_rows) {
         let explain = format!("EXPLAIN QUERY PLAN {sql}");
         let plan = sqlx::query(&explain)
             .fetch_all(pool)
@@ -571,12 +840,23 @@ async fn benchmark_sqlite(
             plan,
         });
     }
+    results.extend(benchmark_under_prune_body!(
+        pool,
+        diagnostics_rows,
+        "EXPLAIN QUERY PLAN",
+        3
+    ));
     Ok(results)
 }
 
-async fn benchmark_postgres(pool: &PgPool, f: &Formula, interval: u32) -> Result<Vec<ReadResult>> {
+async fn benchmark_postgres(
+    pool: &PgPool,
+    f: &Formula,
+    interval: u32,
+    diagnostics_rows: u64,
+) -> Result<Vec<ReadResult>> {
     let mut results = Vec::new();
-    for (name, sql) in read_queries(f, interval) {
+    for (name, sql) in all_read_queries(f, interval, diagnostics_rows) {
         let explain = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {sql}");
         let plan = sqlx::query(&explain)
             .fetch_all(pool)
@@ -593,6 +873,12 @@ async fn benchmark_postgres(pool: &PgPool, f: &Formula, interval: u32) -> Result
             plan,
         });
     }
+    results.extend(benchmark_under_prune_body!(
+        pool,
+        diagnostics_rows,
+        "EXPLAIN (FORMAT TEXT)",
+        0
+    ));
     Ok(results)
 }
 
@@ -687,6 +973,8 @@ async fn main() -> Result<()> {
         inverters: args.inverters,
         layout: args.layout,
         batch_rows: args.batch_rows,
+        diagnostics_rows: args.diagnostics_rows,
+        read_budget_ms: args.read_budget_ms,
     };
 
     let report = if args.target.starts_with("sqlite:") {
@@ -694,23 +982,36 @@ async fn main() -> Result<()> {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
+        // Two connections: WAL lets a reader and the pruner run at once, and
+        // the read-under-prune case needs that overlap to be real.
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(2)
             .connect_with(options)
             .await?;
         schema::initialize_sqlite(&pool).await?;
-        let load = if args.benchmark_only {
+        schema::enable_sqlite_diagnostics(&pool).await?;
+        let mut load = if args.benchmark_only {
             Vec::new()
         } else {
             load_sqlite(&pool, &args, &f).await?
         };
+        if !args.benchmark_only && args.diagnostics_rows > 0 {
+            load.push(load_diagnostics_body!(
+                &pool,
+                args.diagnostics_rows,
+                args.batch_rows
+            ));
+            sqlx::query("ANALYZE").execute(&pool).await?;
+        }
         let observed_checksum = observed_sqlite(&pool, &args, &f).await?;
         if logical_checksum != observed_checksum {
             bail!(
                 "fixture checksum mismatch: expected {logical_checksum}, got {observed_checksum}"
             );
         }
-        let reads = benchmark_sqlite(&pool, &f, args.interval_seconds).await?;
+        let reads =
+            benchmark_sqlite(&pool, &f, args.interval_seconds, args.diagnostics_rows).await?;
+        check_read_budget(&reads, args.read_budget_ms)?;
         let path = args.target.trim_start_matches("sqlite://");
         let wal_bytes = std::fs::metadata(format!("{path}-wal"))
             .map(|metadata| metadata.len())
@@ -749,18 +1050,34 @@ async fn main() -> Result<()> {
             .connect_with(options)
             .await?;
         schema::initialize_postgres(&pool).await?;
-        let load = if args.benchmark_only {
+        schema::enable_postgres_diagnostics(&pool).await?;
+        let mut load = if args.benchmark_only {
             Vec::new()
         } else {
             load_postgres(&pool, &args, &f).await?
         };
+        if !args.benchmark_only && args.diagnostics_rows > 0 {
+            load.push(load_diagnostics_body!(
+                &pool,
+                args.diagnostics_rows,
+                args.batch_rows
+            ));
+            sqlx::query("ANALYZE poll_transmissions")
+                .execute(&pool)
+                .await?;
+            sqlx::query("ANALYZE poll_transmission_devices")
+                .execute(&pool)
+                .await?;
+        }
         let observed_checksum = observed_postgres(&pool, &args, &f).await?;
         if logical_checksum != observed_checksum {
             bail!(
                 "fixture checksum mismatch: expected {logical_checksum}, got {observed_checksum}"
             );
         }
-        let reads = benchmark_postgres(&pool, &f, args.interval_seconds).await?;
+        let reads =
+            benchmark_postgres(&pool, &f, args.interval_seconds, args.diagnostics_rows).await?;
+        check_read_budget(&reads, args.read_budget_ms)?;
         let started = Instant::now();
         sqlx::query("ANALYZE").execute(&pool).await?;
         let maintenance = vec![timing("analyze", 0, started)];
@@ -810,6 +1127,8 @@ mod tests {
             layout,
             batch_rows: 100,
             benchmark_only: false,
+            diagnostics_rows: 0,
+            read_budget_ms: 1_000,
         }
     }
 

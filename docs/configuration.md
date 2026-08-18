@@ -48,6 +48,35 @@ Optional. Controls the poll loop and the HTTP status endpoint.
 | `poll_at_night` | bool | `false` | When `false`, polling only happens between sunrise and sunset (plus [`sun_rs_offset`](#plant) slack). Set `true` to poll around the clock. |
 | `calc_missing_spot` | bool | `false` | SBFspot `CalcMissingSpot`: derive missing Pdc/Pac values from voltage × current when the inverter reports zero. |
 | `poll_consumption` | bool | `false` | Poll the inverter's consumer-power LRIs (`MeteringCsmpTotWIn` / `TotWhIn`) and fill canonical `site_consumption_measurements`. Not in SBFspot, which never queries these; only useful with an SMA consumption meter attached (inverters without one report "LRI not available"). |
+| `transmission_log_retention_hours` | integer (hours) | `48` | How long recorded inverter exchanges are kept for the dashboard's System area. `0` switches recording off; rows already stored are **not** deleted. Must be `0`–`8760`. |
+| `application_log_retention_hours` | integer (hours) | `48` | How long captured application log records are kept **in the service's memory**. They are never written to the database and are lost on restart. `0` switches capture off entirely. Must be `0`–`8760`. |
+| `transmission_log_max_entries` | integer (rows) | `50000` | Row cap for the transmission ring. Must be `1`–`1000000`. |
+| `application_log_max_entries` | integer (records) | `50000` | Record cap for the in-memory log ring, and therefore its memory ceiling. Must be `1`–`1000000`. |
+
+### Sizing the diagnostics rings
+
+The two rings are kept in different places. Transmissions are stored in the
+database and survive a restart; the application log is kept in process memory
+and is lost with the process, because persisting a log line would put a
+database write behind every log call.
+
+The retention window is the primary bound for both; the caps only matter when
+the window alone would not hold. A cycle records roughly 20 entries per
+collector, so at the default 300 s interval a 48-hour window is about 11 500
+entries per collector — a three-collector plant lands near 34 500, well under
+the cap.
+
+Raise a cap when your window would exceed it: a short `interval`, many
+Bluetooth collectors, or a verbose [`[log] level`](#log), where a debugging
+session can burn through the log cap in minutes. Lower them on a constrained
+host. At the defaults the transmission tables cost about **20 MB on SQLite**
+and about **48 MB on PostgreSQL** including indexes, and the log ring costs
+about **12 MB of RSS**.
+
+When a cap is reached before the window elapses, the visible history is
+shorter than the configured retention. That is not hidden: the API reports the
+oldest retained timestamp and the dashboard states the window it is actually
+showing. See [operations](operations.md) and [ui.md](ui.md).
 
 ## `[plant]`
 
@@ -193,6 +222,12 @@ following are violated:
 - no serial is configured more than once;
 - each inverter `password` is `≤ 12` characters;
 - `service.interval` is within `1`–`86400`;
+- `service.transmission_log_retention_hours` and
+  `service.application_log_retention_hours` are within `0`–`8760`;
+- `service.transmission_log_max_entries` and
+  `service.application_log_max_entries` are within `1`–`1000000` — `0` is
+  rejected so an entry cap cannot become a second, silent way to disable
+  recording; use the retention keys for that;
 - `|latitude| ≤ 90` and `|longitude| ≤ 180`;
 - `plant.sun_rs_offset ≤ 3600`;
 - `service.timezone` is a known IANA name;

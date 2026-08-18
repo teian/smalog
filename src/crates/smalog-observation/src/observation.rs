@@ -15,6 +15,16 @@ pub enum ProtocolFamily {
     SmaData1,
 }
 
+impl ProtocolFamily {
+    /// Stable identifier, matching [`Transport::as_str`] in style.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SmaData2Plus => "sma_data_2_plus",
+            Self::SmaData1 => "sma_data_1",
+        }
+    }
+}
+
 /// Protocol and transport provenance, separate from stable inverter identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommunicationIdentity {

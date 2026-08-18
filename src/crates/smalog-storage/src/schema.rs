@@ -17,6 +17,14 @@ const POSTGRES_DAILY_STATISTICS: &str =
     include_str!("../migrations/optional/postgres_daily_statistics.sql");
 const SQLITE_PVOUTPUT: &str = include_str!("../migrations/optional/sqlite_pvoutput.sql");
 const POSTGRES_PVOUTPUT: &str = include_str!("../migrations/optional/postgres_pvoutput.sql");
+const SQLITE_DIAGNOSTICS: &str = include_str!("../migrations/optional/sqlite_diagnostics.sql");
+const POSTGRES_DIAGNOSTICS: &str = include_str!("../migrations/optional/postgres_diagnostics.sql");
+
+/// Tables dropped when runtime diagnostics are disabled. Children first, so
+/// the drop order does not depend on cascade behaviour.
+const DROP_DIAGNOSTICS: &str = "DROP TABLE IF EXISTS poll_transmission_devices;
+     DROP TABLE IF EXISTS poll_transmissions;
+     DELETE FROM schema_metadata WHERE key = 'diagnostics_version';";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseKind {
@@ -72,6 +80,37 @@ pub async fn enable_postgres_daily_statistics(pool: &PgPool) -> Result<()> {
     sqlx::raw_sql(POSTGRES_DAILY_STATISTICS)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Create the optional runtime-diagnostics tables.
+///
+/// These are additive: the canonical schema and [`SCHEMA_VERSION`] are
+/// unchanged, so a database that never enables them is untouched.
+pub async fn enable_sqlite_diagnostics(pool: &SqlitePool) -> Result<()> {
+    sqlx::raw_sql(SQLITE_DIAGNOSTICS).execute(pool).await?;
+    verify_sqlite_text_storage(pool).await?;
+    Ok(())
+}
+
+/// Create the optional runtime-diagnostics tables.
+pub async fn enable_postgres_diagnostics(pool: &PgPool) -> Result<()> {
+    sqlx::raw_sql(POSTGRES_DIAGNOSTICS).execute(pool).await?;
+    Ok(())
+}
+
+/// Drop the runtime-diagnostics tables and their metadata key.
+///
+/// This deletes stored diagnostics, so the service never calls it on its
+/// own; disabling recording in the configuration leaves the rows in place.
+pub async fn disable_sqlite_diagnostics(pool: &SqlitePool) -> Result<()> {
+    sqlx::raw_sql(DROP_DIAGNOSTICS).execute(pool).await?;
+    Ok(())
+}
+
+/// Drop the runtime-diagnostics tables and their metadata key.
+pub async fn disable_postgres_diagnostics(pool: &PgPool) -> Result<()> {
+    sqlx::raw_sql(DROP_DIAGNOSTICS).execute(pool).await?;
     Ok(())
 }
 
@@ -498,6 +537,41 @@ async fn verify_optional_sqlite_text_storage(pool: &SqlitePool) -> Result<()> {
                  a non-TEXT value or embedded NUL"
                     .into(),
             ));
+        }
+    }
+
+    let has_transmissions: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema
+             WHERE type = 'table' AND name = 'poll_transmissions'
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_transmissions {
+        let invalid: Option<String> = sqlx::query_scalar(
+            r#"SELECT location
+               FROM (
+                   SELECT 'poll_transmissions.target' AS location
+                       FROM poll_transmissions
+                       WHERE typeof(target) <> 'text' OR instr(target, char(0)) > 0
+                   UNION ALL
+                   SELECT 'poll_transmissions.request_kind' FROM poll_transmissions
+                       WHERE typeof(request_kind) <> 'text'
+                          OR instr(request_kind, char(0)) > 0
+                   UNION ALL
+                   SELECT 'poll_transmissions.error' FROM poll_transmissions
+                       WHERE error IS NOT NULL
+                         AND (typeof(error) <> 'text' OR instr(error, char(0)) > 0)
+               )
+               LIMIT 1"#,
+        )
+        .fetch_optional(pool)
+        .await?;
+        if let Some(location) = invalid {
+            return Err(Error::Migration(format!(
+                "SQLite text column {location} contains a non-TEXT value or embedded NUL"
+            )));
         }
     }
 

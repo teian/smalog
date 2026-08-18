@@ -160,13 +160,15 @@ only IPv4/IPv6 sockets allowed.
 
 ## HTTP endpoints
 
-When `service.listen` is set, smalog serves two endpoints:
+When `service.listen` is set, smalog serves:
 
 | Path | Method | Response |
 |------|--------|----------|
 | `/healthz` | GET | `200`, `text/plain`, body `ok` |
-| `/status` | GET | `200`, `application/json` (see below) |
-| *(anything else)* | GET | `404` |
+| `/status`, `/api/status` | GET | `200`, `application/json` (see below) |
+| `/api/inverters`, `/api/history`, `/api/diagnostics` | GET | Dashboard data; see [ui.md](ui.md). |
+| `/api/transmissions`, `/api/logs` | GET | Runtime diagnostics; see below and [ui.md](ui.md). |
+| *(anything else)* | GET | `404`, or the embedded dashboard when built `--features ui` |
 
 Sample `/status`:
 
@@ -205,6 +207,62 @@ Set with [`[log]`](configuration.md#log):
   value falls back to `info`.
 - `format` — `text` (default, human-readable) or `json` (one structured
   object per line, for log shippers).
+
+The same records are also captured into an in-memory ring and shown in the
+dashboard's **System → Application log** tab, so the log is readable without
+shell access to the host. Capture sits behind the same `level` filter, so it
+never contains a record stdout did not also receive. That ring is **lost on
+restart** — this journal is the durable copy.
+
+## Diagnosing a silent inverter
+
+The **System** area of the dashboard answers "which request to which inverter
+failed, and what did the service log around it":
+
+- **Transmissions** — every exchange of every Poll Cycle, with the SMA command,
+  the requested register window, how long it took, how many frames each
+  inverter returned, and the outcome. Session steps (`session.begin`,
+  `session.login`, `session.clock_sync`, `session.end`) are entries of their
+  own, so a failed login looks like a failed login rather than an absence of
+  data.
+- **Application log** — the same records the journal has, over the same window.
+
+Both retain 48 hours by default. **Transmissions survive a restart**, so the
+exchanges leading up to a crash are still there afterwards; **the application
+log does not** — it lives in the service's memory, and after a crash the
+journal is where its last lines are. Filter transmissions by outcome `failed`
+to go straight to what broke.
+
+Two things to know when reading them:
+
+- If the row cap was reached before the retention window elapsed, the visible
+  history is shorter than 48 hours. The view says so — it reports the window it
+  is actually showing, not the configured one.
+- A `dropped` count above zero means entries were discarded — by the entry
+  cap, or for transmissions because the background writer fell behind. A gap
+  is then a drop, not a quiet inverter.
+- After a restart the log view says so and starts again from the service's
+  newest record; its cursors are process-local.
+
+Neither ring can affect polling: recording never waits on the database, and a
+failing diagnostics write leaves canonical persistence, CSV and MQTT
+untouched.
+
+### Cost and exposure
+
+At the default caps the transmission tables cost about **20 MB on SQLite** and
+about **48 MB on PostgreSQL**, indexes included, and the in-memory log ring
+costs about **12 MB of RSS**. Lower
+`service.transmission_log_max_entries` and
+`service.application_log_max_entries` on a constrained host; see
+[configuration](configuration.md#sizing-the-diagnostics-rings).
+
+Log content is never written to the database, so it is not included in a
+backup and does not outlive the process. It is still reachable through the
+dashboard, which has **no authentication** — that is not new content (it is
+what stdout already receives) but it is new reach. Keep the dashboard behind a
+reverse proxy if it is exposed, and set
+`service.application_log_retention_hours = 0` to switch capture off entirely.
 
 ## The poll loop
 

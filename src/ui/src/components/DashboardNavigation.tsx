@@ -3,23 +3,35 @@ import {
   Bell,
   ChartNoAxesCombined,
   RadioTower,
+  Terminal,
   type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
-export type DashboardSection = "energy" | "events" | "device" | "grid";
+export type DashboardSection =
+  | "energy"
+  | "events"
+  | "device"
+  | "grid"
+  | "system";
 
 const ITEMS: Array<{
   id: DashboardSection;
-  label: "energyData" | "events" | "deviceStatistics" | "gridQuality";
+  label:
+    | "energyData"
+    | "events"
+    | "deviceStatistics"
+    | "gridQuality"
+    | "system";
   icon: LucideIcon;
 }> = [
   { id: "energy", label: "energyData", icon: ChartNoAxesCombined },
   { id: "events", label: "events", icon: Bell },
   { id: "device", label: "deviceStatistics", icon: Activity },
   { id: "grid", label: "gridQuality", icon: RadioTower },
+  { id: "system", label: "system", icon: Terminal },
 ];
 
 export function DashboardNavigation({

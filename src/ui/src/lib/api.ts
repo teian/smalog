@@ -147,6 +147,108 @@ export interface Diagnostics {
   events: DiagnosticEvent[];
 }
 
+export type TransmissionOutcome = "ok" | "empty" | "failed";
+
+export interface TransmissionDevice {
+  serial: number;
+  frames: number;
+  addressed: boolean;
+}
+
+export interface Transmission {
+  sequence: number;
+  occurredAt: number;
+  target: string;
+  transport: string;
+  protocol: string;
+  requestKind: string;
+  command: number | null;
+  firstLri: number | null;
+  lastLri: number | null;
+  durationMs: number;
+  totalFrames: number;
+  outcome: TransmissionOutcome;
+  error: string | null;
+  detail: string | null;
+  devices: TransmissionDevice[];
+}
+
+export type LogLevel = "error" | "warn" | "info" | "debug" | "trace";
+
+export interface LogRecord {
+  sequence: number;
+  occurredAt: number;
+  level: LogLevel;
+  target: string;
+  message: string;
+  fields: string | null;
+}
+
+/** What a diagnostics ring currently holds. `oldestOccurredAt` next to
+ *  `retentionHours` is what tells a 48-hour window apart from one the entry
+ *  cap cut short. */
+export interface RingEnvelope {
+  cursor: number | null;
+  retentionHours: number;
+  maxEntries: number;
+  retained: number;
+  oldestOccurredAt: number | null;
+  dropped: number;
+  /** Log ring only: the cursor sent was ahead of the ring, so the page
+   *  restarted from the newest record. The log ring lives in the service's
+   *  memory and its cursors restart with the process. */
+  reset?: boolean;
+}
+
+export interface TransmissionsResponse {
+  entries: Transmission[];
+  envelope: RingEnvelope;
+}
+
+export interface LogsResponse {
+  entries: LogRecord[];
+  envelope: RingEnvelope;
+}
+
+/** Keyset paging: `since` follows the live tail, `before` walks backwards
+ *  through the retained window. Never both at once. */
+export interface RingQuery {
+  since?: number | null;
+  before?: number | null;
+  limit?: number;
+}
+
+function ringParams(query: RingQuery): URLSearchParams {
+  const params = new URLSearchParams();
+  if (query.since != null) params.set("since", String(query.since));
+  if (query.before != null) params.set("before", String(query.before));
+  if (query.limit != null) params.set("limit", String(query.limit));
+  return params;
+}
+
+export function fetchTransmissions(
+  query: RingQuery & {
+    outcome?: TransmissionOutcome | null;
+    target?: string | null;
+    serial?: number | null;
+  } = {},
+): Promise<TransmissionsResponse> {
+  const params = ringParams(query);
+  if (query.outcome) params.set("outcome", query.outcome);
+  if (query.target) params.set("target", query.target);
+  if (query.serial != null) params.set("serial", String(query.serial));
+  return getJson<TransmissionsResponse>(`/api/transmissions?${params.toString()}`);
+}
+
+export function fetchLogs(
+  query: RingQuery & { level?: LogLevel | null; target?: string | null } = {},
+): Promise<LogsResponse> {
+  const params = ringParams(query);
+  if (query.level) params.set("level", query.level);
+  if (query.target) params.set("target", query.target);
+  return getJson<LogsResponse>(`/api/logs?${params.toString()}`);
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(`${BASE}${path}`);
   if (!response.ok) {

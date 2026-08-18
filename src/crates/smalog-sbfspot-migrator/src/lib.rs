@@ -1045,7 +1045,17 @@ fn available_space_for(path: &Path) -> Result<u64> {
     }
     // SAFETY: statvfs returned success and initialized the structure.
     let statistics = unsafe { statistics.assume_init() };
-    Ok(statistics.f_bavail.saturating_mul(statistics.f_frsize))
+    Ok(free_bytes(statistics.f_bavail, statistics.f_frsize))
+}
+
+/// Free bytes from a block count and a block size.
+///
+/// Generic over the widening because `statvfs` types are architecture
+/// dependent: 64-bit targets report `u64`, 32-bit ones such as armv7 report
+/// `u32`, where multiplying before widening saturates at 4 GiB and would
+/// understate the free space on any card larger than that.
+fn free_bytes(blocks: impl Into<u64>, block_size: impl Into<u64>) -> u64 {
+    blocks.into().saturating_mul(block_size.into())
 }
 
 #[cfg(not(unix))]

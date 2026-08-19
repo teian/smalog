@@ -144,8 +144,8 @@ Release binaries include the embedded web dashboard.
 
 #### Option C: build from source
 
-The service requires Rust `1.85` or newer. The CI and container builds use
-Rust `1.93`. On Debian or Ubuntu, install the native build tools and Rust:
+The service requires Rust `1.89` or newer. The CI and container builds use
+Rust `1.97`. On Debian or Ubuntu, install the native build tools and Rust:
 
 ```bash
 sudo apt-get update

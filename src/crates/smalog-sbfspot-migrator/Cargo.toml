@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Resumable migration from SBFspot SQLite databases into smalog schema v1"
 license = "EUPL-1.2"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [dependencies]
 chrono = "0.4.45"

@@ -13,7 +13,7 @@ pub fn make_response(
     record_size: usize,
     records: &[u8],
 ) -> Vec<u8> {
-    assert!(record_size > 0 && records.len() % record_size == 0);
+    assert!(record_size > 0 && records.len().is_multiple_of(record_size));
     let nrec = (records.len() / record_size) as u32;
     let first: u32 = 0;
     let last: u32 = nrec.saturating_sub(1);

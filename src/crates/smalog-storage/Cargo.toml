@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Canonical schema, domain model, and database storage for smalog"
 license = "EUPL-1.2"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [dependencies]
 chrono = "0.4.45"

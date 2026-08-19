@@ -174,7 +174,7 @@ ReadWritePaths=/var/lib/smalog
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_INET AF_INET6 AF_BLUETOOTH
 
 [Install]
 WantedBy=multi-user.target

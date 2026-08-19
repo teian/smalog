@@ -126,6 +126,9 @@ user_group = "user"
 # synch_time = 0
 # synch_time_low = 60
 # synch_time_high = 3600
+# Protocol debugging: append every raw Bluetooth frame to this file.
+# Off unless set; see docs/bluetooth.md#raw-frame-capture.
+# capture_file = "/var/lib/smalog/garage.btcap"
 
 # SBFspot-compatible CSV export. Off by default — the database is the
 # system of record. When enabled, each poll appends a spot row (and a

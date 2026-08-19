@@ -239,6 +239,8 @@ pub enum InverterCommunication {
     Bluetooth {
         address: String,
         local_adapter: Option<String>,
+        /// Optional file for a raw Bluetooth frame capture (debugging).
+        capture_file: Option<String>,
         #[serde(default)]
         mis_enabled: bool,
         #[serde(default)]
@@ -498,6 +500,7 @@ impl InverterConfig {
         let InverterCommunication::Bluetooth {
             address,
             local_adapter,
+            capture_file,
             mis_enabled,
             synch_time,
             synch_time_low,
@@ -530,6 +533,7 @@ impl InverterConfig {
             synch_time_high: *synch_time_high,
             tz_offset,
             dst,
+            capture: capture_file.as_ref().map(std::path::PathBuf::from),
         })
     }
 }

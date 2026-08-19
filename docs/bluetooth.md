@@ -20,10 +20,11 @@ Ethernet inverters in one process.
   D-Bus mount, or a device mapping. The host must still power and
   configure the adapter. See
   [docker.md](docker.md#bluetooth--host-networking).
-- **Untested against hardware in this build.** The framing behavior is
-  informed by SBFspot and covered by round-trip tests, but this independent
-  implementation has not been run against a real inverter here. Do a first
-  run with `log.level = "debug"`.
+- **Young implementation.** The framing behavior is informed by SBFspot
+  and covered by round-trip tests, but this independent implementation has
+  seen far less hardware than SBFspot has. Do a first run with
+  `log.level = "debug"`, and use the raw capture below when a query stays
+  unanswered.
 
 ## Configuration
 
@@ -136,12 +137,57 @@ Under the hood:
   `BT_TIMEOUT`). The blocking session runs off the async executor via
   `block_in_place`.
 - **Client** ([bt/client.rs](../src/crates/smalog-connection/src/bluetooth.rs)) — the
-  init/MIS handshake, the timestamp-verified login, and broadcast data
-  requests whose replies are routed to inverters by source BT address.
+  init/MIS handshake, the timestamp-verified login, and the data requests.
+  Each device is queried on its own, addressed by its SUSyID/serial (as
+  SBFspot does): spot values with control byte `0xA0` in a frame sent to
+  the `addr_unknown` broadcast address, archive commands with `0xE0` in a
+  frame addressed to the inverter itself. Replies are matched by source
+  BT address.
+- **Reassembly** — a reply longer than one Bluetooth frame arrives split
+  over several L1 frames; the continuations carry raw payload behind
+  their own header and may use a different L1 command. Fragments are
+  collected still escaped (an escape pair can straddle the boundary) and
+  only the completed packet is de-escaped and FCS-checked.
 - **Decode reuse** — received SMA Data 2 Plus packets are de-escaped and
   normalized into the same byte layout as an ethernet datagram, so all
   the record decoding and archive logic is shared with the ethernet path
   unchanged.
+
+## Raw frame capture
+
+For protocol-level debugging, smalog can append **every** Bluetooth L1
+frame it sends and receives to a file — the bytes as they hit the socket,
+before de-escaping and reassembly. That is the only view that shows
+fragmentation, escaping and FCS problems.
+
+Per inverter, in the configuration:
+
+```toml
+[[inverter]]
+name = "Garage"
+communication = "bluetooth"
+address = "00:80:25:AA:BB:CC"
+capture_file = "/var/lib/smalog/garage.btcap"
+```
+
+Or for a single test run, without touching the configuration:
+
+```bash
+smalog --config config.toml test-bluetooth --all --capture /tmp/bt.capture
+```
+
+The file is appended to (never truncated), one frame per line:
+
+```text
+# smalog bluetooth capture — peer 00:80:25:AA:BB:CC, opened 2026-08-19T09:03:40.101010Z
+2026-08-19T09:03:40.123456Z TX 44 7E2C0052...
+2026-08-19T09:03:40.187654Z RX 118 7E76000C...
+```
+
+`TX` is host → inverter, `RX` inverter → host, followed by the frame
+length and its raw bytes in hex. Capturing never breaks a session: if the
+file cannot be written, smalog logs a warning once and carries on. Leave
+it off in normal operation — it grows by every frame of every poll cycle.
 
 ## Troubleshooting
 
@@ -155,3 +201,7 @@ Under the hood:
 - **Timeouts mid-cycle** — increase proximity/signal; Bluetooth range to
   SMA inverters is short. Consider the ethernet transport if the inverter
   has a Speedwire interface.
+- **Individual queries stay unanswered while others succeed** — that is a
+  protocol problem, not a range problem. Record a capture (above) and
+  check at `log.level = "debug"` whether replies arrive and get dropped
+  (`bt: dropping reply frame`) or never arrive at all.

@@ -35,7 +35,21 @@ impl BtSocket for LinuxRfcomm {
                 BTPROTO_RFCOMM,
             );
             if raw < 0 {
-                return Err(bt_io("socket(AF_BLUETOOTH)"));
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+                    // Typically a sandbox rather than a missing driver: a
+                    // systemd unit needs AF_BLUETOOTH in
+                    // RestrictAddressFamilies, a container needs host
+                    // networking.
+                    return Err(Error::Protocol(format!(
+                        "socket(AF_BLUETOOTH): {err} — the Bluetooth address \
+                         family is unavailable: the kernel lacks Bluetooth \
+                         support, the systemd unit restricts \
+                         RestrictAddressFamilies (add AF_BLUETOOTH), or the \
+                         container runs without host networking"
+                    )));
+                }
+                return Err(Error::Protocol(format!("socket(AF_BLUETOOTH): {err}")));
             }
             let fd = OwnedFd::from_raw_fd(raw);
 

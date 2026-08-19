@@ -51,6 +51,10 @@ enum Command {
         /// after the first successful representative query.
         #[arg(long)]
         all: bool,
+        /// Append every raw Bluetooth frame to this file, overriding
+        /// `capture_file` from the configuration.
+        #[arg(long, value_name = "FILE")]
+        capture: Option<std::path::PathBuf>,
     },
     /// Validate the configuration file and exit.
     CheckConfig,
@@ -189,7 +193,9 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Command::TestBluetooth { all } => test_bluetooth(&cli.config, all).await,
+        Command::TestBluetooth { all, capture } => {
+            test_bluetooth(&cli.config, all, capture.as_deref()).await
+        }
         Command::MigrateSbfspot {
             source,
             target,
@@ -407,7 +413,11 @@ async fn rebuild_daily_yields(
     }
 }
 
-async fn test_bluetooth(config_path: &std::path::Path, all: bool) -> ExitCode {
+async fn test_bluetooth(
+    config_path: &std::path::Path,
+    all: bool,
+    capture: Option<&std::path::Path>,
+) -> ExitCode {
     let config = match Config::load(config_path) {
         Ok(config) => config,
         Err(error) => {
@@ -441,7 +451,12 @@ async fn test_bluetooth(config_path: &std::path::Path, all: bool) -> ExitCode {
     let mut groups: Vec<(smalog_connection::BluetoothParams, Vec<&InverterConfig>)> = Vec::new();
     for configured in bluetooth {
         let params = match configured.to_bluetooth_params(tz) {
-            Ok(params) => params,
+            Ok(mut params) => {
+                if let Some(path) = capture {
+                    params.capture = Some(path.to_path_buf());
+                }
+                params
+            }
             Err(error) => {
                 eprintln!("{}: config error: {error}", configured.name);
                 failed = true;
@@ -827,7 +842,7 @@ mod tests {
             Cli::try_parse_from(["smalog", "test-bluetooth", "--all"]).expect("valid command");
         assert!(matches!(
             cli.command,
-            Some(Command::TestBluetooth { all: true })
+            Some(Command::TestBluetooth { all: true, .. })
         ));
     }
 
@@ -836,7 +851,7 @@ mod tests {
         let cli = Cli::try_parse_from(["smalog", "test-bluetooth"]).expect("valid command");
         assert!(matches!(
             cli.command,
-            Some(Command::TestBluetooth { all: false })
+            Some(Command::TestBluetooth { all: false, .. })
         ));
     }
 

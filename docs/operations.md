@@ -149,6 +149,24 @@ Purging removes what the package created and nothing else. A database you
 configured outside `/var/lib/smalog` is not found or deleted by it — and
 neither is your configuration.
 
+### Building a package without a release
+
+To test a change on the Pi before it is released, build the same artefacts
+locally:
+
+```bash
+scripts/build-packages.sh                    # armhf and arm64, UI included
+scripts/build-packages.sh --skip-ui-build aarch64-unknown-linux-gnu
+```
+
+They land in `dist/`, named as in a release, with a `SHA256SUMS` beside them.
+The build needs `cross`, `cargo-deb`, `jq`, a running Docker or Podman, and
+`pnpm` for the dashboard; `--no-ui` drops the last requirement, `--all` builds
+every target the release workflow builds. The packaged Debian changelog is
+whatever is committed — unlike the workflow, a local build never rewrites a
+file in the working tree, so the package version comes straight from
+`src/crates/smalog/Cargo.toml`.
+
 ## Running under systemd
 
 A ready-to-use unit lives at

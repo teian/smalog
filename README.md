@@ -460,6 +460,21 @@ More operational detail is available in
 [Operations](docs/operations.md), [Bluetooth](docs/bluetooth.md),
 [Database](docs/database.md) and [Web UI](docs/ui.md).
 
+### Building the packages locally
+
+The release archives and Debian packages can be built without a release or a
+pipeline run:
+
+```bash
+scripts/build-packages.sh                  # armhf + arm64 .deb, with the UI
+scripts/build-packages.sh --all            # every target the workflow builds
+scripts/build-packages.sh --no-ui aarch64-unknown-linux-gnu
+```
+
+The artefacts land in `dist/`, named as in a release. It needs `cross`,
+`cargo-deb`, `jq`, a running Docker or Podman for foreign targets, and `pnpm`
+unless the UI is skipped. `scripts/build-packages.sh --help` lists the options.
+
 ### Releases
 
 GitHub Actions checks Rust formatting and linting, runs the Rust test suite, and

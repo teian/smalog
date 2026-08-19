@@ -11,6 +11,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Locally built release artefacts (scripts/build-packages.sh)
+/dist/
+
 # Local runtime data
 *.db
 *.db-shm

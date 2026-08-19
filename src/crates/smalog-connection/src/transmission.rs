@@ -96,6 +96,10 @@ pub enum TransmissionOutcome {
     Ok,
     /// Completed without a transport error, but no device answered.
     Empty,
+    /// Completed: every addressed device answered "LRI not available", so
+    /// this value does not exist on those models. A definitive answer, not a
+    /// missing one — and the reason the query may be skipped from now on.
+    Unsupported,
     /// Did not complete: timeout, transport failure or protocol error.
     Failed,
 }
@@ -106,6 +110,7 @@ impl TransmissionOutcome {
         match self {
             Self::Ok => "ok",
             Self::Empty => "empty",
+            Self::Unsupported => "unsupported",
             Self::Failed => "failed",
         }
     }

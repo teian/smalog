@@ -6,6 +6,7 @@
 pub mod diagnostics;
 pub mod domain;
 pub mod error;
+pub mod query_support;
 pub mod schema;
 pub mod storage;
 

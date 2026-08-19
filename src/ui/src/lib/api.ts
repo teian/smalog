@@ -147,7 +147,7 @@ export interface Diagnostics {
   events: DiagnosticEvent[];
 }
 
-export type TransmissionOutcome = "ok" | "empty" | "failed";
+export type TransmissionOutcome = "ok" | "empty" | "unsupported" | "failed";
 
 export interface TransmissionDevice {
   serial: number;

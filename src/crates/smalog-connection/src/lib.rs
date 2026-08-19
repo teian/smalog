@@ -31,6 +31,7 @@ pub mod collector;
 pub mod connection;
 pub mod error;
 mod observation;
+pub mod query_support;
 pub mod smadata1;
 pub mod smadata2;
 pub mod speedwire;
@@ -39,9 +40,11 @@ pub mod transmission;
 pub use bluetooth::{BluetoothConnection, BluetoothParams, BtSocket};
 pub use collector::{Collector, PollOptions};
 pub use connection::{
-    encode_password, is_lri_not_available, ClockMode, Connection, DeviceId, SyncOutcome, UserGroup,
+    encode_password, is_lri_not_available, ClockMode, Connection, DeviceId, RequestReply,
+    SyncOutcome, UserGroup,
 };
 pub use error::{Error, Result};
+pub use query_support::{QuerySupportStore, SUPPORT_RECHECK_DAYS};
 pub use smadata1::powerline::{PowerlineConnection, PowerlineParams};
 pub use smadata1::rs232::{Rs232Connection, Rs232Params};
 pub use smadata1::rs485::{Rs485Connection, Rs485Params};

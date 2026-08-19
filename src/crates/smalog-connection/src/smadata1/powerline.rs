@@ -3,9 +3,7 @@
 //! The connection boundary is available, but Sunny-Net framing, medium
 //! access and adapter I/O are not implemented yet.
 
-use std::collections::HashMap;
-
-use crate::connection::{ClockMode, Connection, DeviceId, SyncOutcome, UserGroup};
+use crate::connection::{ClockMode, Connection, DeviceId, RequestReply, SyncOutcome, UserGroup};
 use crate::error::{Error, Result};
 use crate::smadata1::{SmaData1Connection, SmaData1Medium};
 
@@ -71,7 +69,7 @@ impl Connection for PowerlineConnection {
         _first: u32,
         _last: u32,
         _events: bool,
-    ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+    ) -> Result<RequestReply> {
         Err(unavailable())
     }
 

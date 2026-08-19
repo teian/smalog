@@ -9,6 +9,10 @@ static SQLITE_MIGRATOR: Migrator = sqlx::migrate!("./migrations/sqlite");
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
 
 pub const SCHEMA_VERSION: &str = "1";
+/// Version of the optional diagnostics tables. A database holding an older
+/// one is rebuilt on start: the ring is a short-retention buffer, so
+/// recreating it costs recent diagnostics rows and nothing canonical.
+pub const DIAGNOSTICS_VERSION: &str = "2";
 pub const IMPLEMENTATION_VERSION: &str = "1";
 
 const SQLITE_DAILY_STATISTICS: &str =
@@ -88,6 +92,13 @@ pub async fn enable_postgres_daily_statistics(pool: &PgPool) -> Result<()> {
 /// These are additive: the canonical schema and [`SCHEMA_VERSION`] are
 /// unchanged, so a database that never enables them is untouched.
 pub async fn enable_sqlite_diagnostics(pool: &SqlitePool) -> Result<()> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM schema_metadata WHERE key = 'diagnostics_version'")
+            .fetch_optional(pool)
+            .await?;
+    if stored.is_some_and(|version| version != DIAGNOSTICS_VERSION) {
+        sqlx::raw_sql(DROP_DIAGNOSTICS).execute(pool).await?;
+    }
     sqlx::raw_sql(SQLITE_DIAGNOSTICS).execute(pool).await?;
     verify_sqlite_text_storage(pool).await?;
     Ok(())
@@ -95,6 +106,13 @@ pub async fn enable_sqlite_diagnostics(pool: &SqlitePool) -> Result<()> {
 
 /// Create the optional runtime-diagnostics tables.
 pub async fn enable_postgres_diagnostics(pool: &PgPool) -> Result<()> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM schema_metadata WHERE key = 'diagnostics_version'")
+            .fetch_optional(pool)
+            .await?;
+    if stored.is_some_and(|version| version != DIAGNOSTICS_VERSION) {
+        sqlx::raw_sql(DROP_DIAGNOSTICS).execute(pool).await?;
+    }
     sqlx::raw_sql(POSTGRES_DIAGNOSTICS).execute(pool).await?;
     Ok(())
 }

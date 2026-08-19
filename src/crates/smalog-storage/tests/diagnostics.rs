@@ -98,7 +98,7 @@ async fn enabling_creates_the_tables_and_disabling_drops_them() {
         "the application log is a memory buffer, not a table"
     );
     let version: Option<String> = db.get_config("diagnostics_version").await.unwrap();
-    assert_eq!(version.as_deref(), Some("1"));
+    assert_eq!(version.as_deref(), Some(schema::DIAGNOSTICS_VERSION));
 
     // The canonical schema version is untouched by an optional table.
     let schema_version: Option<String> = db.get_config("schema_version").await.unwrap();

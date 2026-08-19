@@ -5,9 +5,7 @@
 //! implementations. Serial framing and device discovery are not implemented
 //! yet; attempting to begin a session returns an explicit unsupported error.
 
-use std::collections::HashMap;
-
-use crate::connection::{ClockMode, Connection, DeviceId, SyncOutcome, UserGroup};
+use crate::connection::{ClockMode, Connection, DeviceId, RequestReply, SyncOutcome, UserGroup};
 use crate::error::{Error, Result};
 use crate::smadata1::{SmaData1Connection, SmaData1Medium};
 
@@ -82,7 +80,7 @@ impl Connection for Rs485Connection {
         _first: u32,
         _last: u32,
         _events: bool,
-    ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+    ) -> Result<RequestReply> {
         Err(Error::Unsupported(
             "SMA Data V1/SMA-Net over RS485 is not implemented yet",
         ))

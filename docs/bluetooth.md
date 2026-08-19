@@ -201,7 +201,11 @@ it off in normal operation — it grows by every frame of every poll cycle.
 - **Timeouts mid-cycle** — increase proximity/signal; Bluetooth range to
   SMA inverters is short. Consider the ethernet transport if the inverter
   has a Speedwire interface.
-- **Individual queries stay unanswered while others succeed** — that is a
-  protocol problem, not a range problem. Record a capture (above) and
-  check at `log.level = "debug"` whether replies arrive and get dropped
-  (`bt: dropping reply frame`) or never arrive at all.
+- **Individual queries stay unanswered while others succeed** — check the
+  outcome first. `nicht verfügbar` / `not available` means the inverter
+  answered that it does not have the value (SMA error 21), which is normal
+  for phase-wise AC power, grid-relay status, temperature or grid metering
+  on a small single-phase inverter; smalog stops asking after the first
+  such answer. Only `keine Antwort` / `no answer` is a problem: record a
+  capture (above) and check at `log.level = "debug"` whether replies arrive
+  and get dropped (`bt: dropping reply frame`) or never arrive at all.

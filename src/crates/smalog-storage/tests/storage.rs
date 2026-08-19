@@ -123,11 +123,15 @@ async fn ordered_migrations_are_idempotent_and_concurrency_safe() {
     second.expect("second concurrent startup");
 
     let pool = sqlite_pool(&first);
-    let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
-        .fetch_one(pool)
-        .await
-        .unwrap();
-    assert_eq!(migration_count, 1);
+    // Each migration applied exactly once, whatever their number: two racing
+    // startups must not double-apply one.
+    let (applied, distinct): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT version) FROM _sqlx_migrations")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(applied >= 1, "the schema migration must have run");
+    assert_eq!(applied, distinct, "a migration was applied twice");
 
     let metadata = sqlx::query("SELECT key, value FROM schema_metadata ORDER BY key")
         .fetch_all(pool)

@@ -21,12 +21,13 @@
 mod conn;
 pub mod packet;
 
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use tracing::{debug, trace, warn};
 
-use crate::connection::{encode_password, is_lri_not_available, Connection, DeviceId, UserGroup};
+use crate::connection::{
+    encode_password, is_lri_not_available, Connection, DeviceId, RequestReply, UserGroup,
+};
 use crate::error::{Error, Result};
 use crate::smadata2::commands::{
     CMD_IDENTIFY, CMD_LOGIN, CMD_LOGOFF, MAX_RETRY, SMA_ERR_INVALID_PASSWORD,
@@ -541,8 +542,8 @@ impl Connection for SpeedwireConnection {
         first: u32,
         last: u32,
         events: bool,
-    ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
-        let mut out = HashMap::new();
+    ) -> Result<RequestReply> {
+        let mut reply = RequestReply::default();
         for i in 0..self.devices.len() {
             let (ip, susy, serial) = {
                 let d = &self.devices[i];
@@ -553,15 +554,16 @@ impl Connection for SpeedwireConnection {
                 .await
             {
                 Ok(frames) => {
-                    out.insert(serial, frames);
+                    reply.frames.insert(serial, frames);
                 }
                 Err(e) if is_lri_not_available(&e) => {
                     debug!(serial, "LRI not available");
+                    reply.unsupported.insert(serial);
                 }
                 Err(e) => warn!(serial, error = %e, "request failed"),
             }
         }
-        Ok(out)
+        Ok(reply)
     }
 
     async fn end(&mut self) {

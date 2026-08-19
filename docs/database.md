@@ -129,8 +129,14 @@ version when enabled:
 |---|---|---|
 | `inverter_daily_statistics` | PK `(inverter_id, statistics_date)`; index `(statistics_date, inverter_id)` | Rebuildable cache of peak/mean AC/DC power, actual/expected sample counts, coverage timestamps, completeness, calculation time, and source watermark. Normal production/yield results never depend on it. Enabled by `database.daily_statistics = true` or migration `--daily-statistics`. |
 | `pvoutput_exports` | PK `(inverter_id, measured_at)` | Optional imported export state (`exported_at`, `attempts`, `last_error`). Created only by migration with `--pvoutput-state legacy-flag`. smalog provides no PVOutput uploader or writable compatibility adapter. |
-| `poll_transmissions` | PK `transmission_id` (autoincrement/identity); indexes `(occurred_at)`, `(outcome, transmission_id DESC)`, `(target, transmission_id DESC)` | One row per inverter exchange: occurred-at (epoch **milliseconds**), collector target, transport, protocol, request kind, SMA command, LRI window, duration, total frames, outcome (`ok`/`empty`/`failed`), error, detail. Metadata only — never frame payloads. |
+| `poll_transmissions` | PK `transmission_id` (autoincrement/identity); indexes `(occurred_at)`, `(outcome, transmission_id DESC)`, `(target, transmission_id DESC)` | One row per inverter exchange: occurred-at (epoch **milliseconds**), collector target, transport, protocol, request kind, SMA command, LRI window, duration, total frames, outcome (`ok`/`empty`/`unsupported`/`failed`), error, detail. Metadata only — never frame payloads. |
 | `poll_transmission_devices` | PK `(transmission_id, serial_number)` with `ON DELETE CASCADE`; index `(serial_number, transmission_id DESC)` | One row per serial an exchange addressed or that answered it, with its frame count. |
+
+The canonical schema additionally carries:
+
+| Table | Key/index | Behavior |
+|---|---|---|
+| `inverter_query_support` | PK `(serial_number, query)` | One row per query an inverter answered "LRI not available" to, with the model it reported and the epoch second of the most recent refusal. The collector skips those queries until the entry ages out of its recheck window (30 days), so a firmware update that adds a value is still noticed. Deleting rows makes the next cycle ask again. |
 
 Dropping the daily-statistics component cannot remove authoritative
 measurements or daily yields. The PVOutput option performs a one-time import;

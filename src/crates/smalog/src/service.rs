@@ -25,6 +25,7 @@ use crate::config::{Config, InverterCommunication, InverterConfig};
 use crate::daylight;
 use crate::diagnostics::{CollectorSink, DiagnosticsWriter, RingBounds, Shutdown, WriteQueue};
 use crate::error::Result;
+use crate::query_support::QuerySupport;
 use crate::storage::Db;
 use smalog_connection::{
     BluetoothConnection, Collector, Connection, PollOptions, SpeedwireConnection,
@@ -106,6 +107,7 @@ impl Service {
             &config,
             tz,
             transmission_ring.enabled().then(|| diagnostics.clone()),
+            QuerySupport::load(db.clone()).await,
         )
         .await?;
         let mqtt = if config.mqtt.enabled {
@@ -138,6 +140,7 @@ impl Service {
         config: &Config,
         tz: Tz,
         diagnostics: Option<Arc<WriteQueue>>,
+        support: Arc<QuerySupport>,
     ) -> Result<Vec<ConfiguredCollector>> {
         let options = PollOptions {
             calc_missing_spot: config.service.calc_missing_spot,
@@ -178,7 +181,8 @@ impl Service {
                     CollectorSink::new(queue.clone(), &target),
                 ),
                 None => Collector::new(connector, tz, options),
-            };
+            }
+            .with_query_support(support.clone());
             collectors.push(ConfiguredCollector { target, collector });
         }
         for inverter in config
@@ -197,7 +201,8 @@ impl Service {
                     CollectorSink::new(queue.clone(), &target),
                 ),
                 None => Collector::new(Box::new(bluetooth), tz, options),
-            };
+            }
+            .with_query_support(support.clone());
             collectors.push(ConfiguredCollector { target, collector });
         }
         Ok(collectors)
@@ -824,8 +829,8 @@ async fn transmissions_handler(
         Err(detail) => return bad_parameter("limit", &detail),
     };
     if let Some(outcome) = &params.outcome {
-        if !matches!(outcome.as_str(), "ok" | "empty" | "failed") {
-            return bad_parameter("outcome", "must be one of ok, empty, failed");
+        if !matches!(outcome.as_str(), "ok" | "empty" | "unsupported" | "failed") {
+            return bad_parameter("outcome", "must be one of ok, empty, unsupported, failed");
         }
     }
     if !state.transmission_ring.enabled() {

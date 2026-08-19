@@ -292,6 +292,27 @@ log does not** — it lives in the service's memory, and after a crash the
 journal is where its last lines are. Filter transmissions by outcome `failed`
 to go straight to what broke.
 
+Every exchange carries one of four outcomes:
+
+| Outcome | Dashboard | What it means |
+|---|---|---|
+| `ok` | ok | At least one inverter answered with frames. |
+| `empty` | no answer | Nobody answered inside the retry budget. A real problem: range, a sleeping inverter, a busy adapter. |
+| `unsupported` | not available | Every addressed inverter answered SMA error 21 — the value does not exist on that model. An answer, not a failure. |
+| `failed` | failed | The exchange did not complete: transport error, protocol error, timeout while connecting. |
+
+**A refused query is asked once, then remembered.** The first `unsupported`
+answer per inverter and query is stored in `inverter_query_support`, and later
+cycles skip that query instead of spending a round trip on an answer that will
+not change — they still record it, at 0 ms, so the dashboard keeps showing why
+a value is absent. The memory expires after 30 days, so a firmware update that
+adds a value is picked up on its own. To force an immediate re-probe, delete
+the rows:
+
+```bash
+sqlite3 /var/lib/smalog/smalog.db 'DELETE FROM inverter_query_support;'
+```
+
 Two things to know when reading them:
 
 - If the row cap was reached before the retention window elapsed, the visible

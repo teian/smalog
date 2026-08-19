@@ -1,3 +1,16 @@
+smalog (0.2.0-1) unstable; urgency=medium
+
+  * Bluetooth: address data requests per inverter and reassemble replies
+    that span several frames, so archive and DC/AC queries answer again.
+  * Bluetooth: the systemd unit permits AF_BLUETOOTH; raw frame capture
+    can be enabled with capture_file or `test-bluetooth --capture`.
+  * MQTT: moved to the maintained rumqttc-v4-next client, clearing four
+    rustls-webpki advisories.
+  * Builds on Rust 1.97.1; the minimum supported Rust version is 1.89.
+    Release notes: https://github.com/teian/smalog/releases
+
+ -- Frank Gehann <fg@fgehann.de>  Wed, 19 Aug 2026 09:00:00 +0000
+
 smalog (0.1.0-1) unstable; urgency=medium
 
   * Initial Debian package for armhf and arm64.

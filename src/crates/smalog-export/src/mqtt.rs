@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use chrono_tz::Tz;
-use rumqttc::{AsyncClient, LastWill, MqttOptions, QoS};
+use rumqttc::{AsyncClient, Broker, LastWill, MqttOptions, PublishOptions, QoS};
 use serde_json::{json, Map, Value as Json};
 use tracing::{debug, warn};
 
@@ -41,6 +41,9 @@ struct Msg {
     payload: String,
     retain: bool,
 }
+
+/// Broker keep-alive, in seconds (the client takes whole seconds).
+const KEEP_ALIVE_SECONDS: u16 = 30;
 
 pub struct Publisher {
     client: AsyncClient,
@@ -69,8 +72,8 @@ impl Publisher {
             .unwrap_or_else(|| format!("smalog-{}", std::process::id()));
         let bridge_topic = format!("{}/bridge/availability", root_prefix(&cfg.base_topic));
 
-        let mut opts = MqttOptions::new(client_id, &cfg.host, cfg.port);
-        opts.set_keep_alive(std::time::Duration::from_secs(30));
+        let mut opts = MqttOptions::new(client_id, Broker::tcp(&cfg.host, cfg.port));
+        opts.set_keep_alive(KEEP_ALIVE_SECONDS);
         if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
             opts.set_credentials(user.clone(), pass.clone());
         }
@@ -82,9 +85,13 @@ impl Publisher {
             true,
         ));
 
-        let (client, mut eventloop) = AsyncClient::new(opts, 16);
+        let (client, mut eventloop) = AsyncClient::builder(opts).capacity(16).build();
         // Announce online (retained); queued until the connection is up.
-        let _ = client.try_publish(&bridge_topic, QoS::AtLeastOnce, true, "online");
+        let _ = client.try_publish(
+            &bridge_topic,
+            "online",
+            PublishOptions::new(QoS::AtLeastOnce).retained(),
+        );
         tokio::spawn(async move {
             loop {
                 match eventloop.poll().await {
@@ -140,7 +147,11 @@ impl Publisher {
         for m in msgs {
             debug!(topic = %m.topic, "mqtt publish");
             self.client
-                .publish(m.topic, self.qos(), m.retain, m.payload)
+                .publish(
+                    m.topic,
+                    m.payload,
+                    PublishOptions::new(self.qos()).retain(m.retain),
+                )
                 .await
                 .map_err(|e| Error::Mqtt(e.to_string()))?;
         }
@@ -595,5 +606,85 @@ mod tests {
         let payload: Json = serde_json::from_str(&discovery.payload).unwrap();
         assert_eq!(payload["device"]["name"], "Grüße aus 東京 🌞");
         assert_eq!(payload["device"]["model"], "Wechselrichter Δ");
+    }
+}
+
+/// The client is exercised against a fake broker: these tests cover the
+/// wire behaviour the pure `build_messages` tests cannot see — the CONNECT
+/// options and the retained availability publish.
+#[cfg(test)]
+mod broker_tests {
+    use super::*;
+    use bytes::BytesMut;
+    use rumqttc::mqttbytes::v4::{ConnAck, Connect, ConnectReturnCode, Packet, Publish};
+    use rumqttc::mqttbytes::Error as MqttBytesError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Accept one client, acknowledge its CONNECT and return that packet
+    /// together with the first publish it sends.
+    async fn fake_broker(listener: TcpListener) -> (Connect, Publish) {
+        let (mut socket, _) = listener.accept().await.expect("client connects");
+        let mut buf = BytesMut::with_capacity(2048);
+        let (mut connect, mut publish) = (None, None);
+        while connect.is_none() || publish.is_none() {
+            match Packet::read(&mut buf, 16 * 1024) {
+                Ok(Packet::Connect(packet)) => {
+                    let mut ack = BytesMut::new();
+                    ConnAck::new(ConnectReturnCode::Success, false)
+                        .write(&mut ack)
+                        .expect("connack encodes");
+                    socket.write_all(&ack).await.expect("connack is sent");
+                    connect = Some(packet);
+                }
+                Ok(Packet::Publish(packet)) => publish = Some(packet),
+                Ok(_) => {}
+                Err(MqttBytesError::InsufficientBytes(_)) => {
+                    let read = socket.read_buf(&mut buf).await.expect("broker reads");
+                    assert!(read > 0, "client closed the connection early");
+                }
+                Err(e) => panic!("client sent an undecodable packet: {e}"),
+            }
+        }
+        (connect.expect("connect"), publish.expect("publish"))
+    }
+
+    fn config(port: u16) -> MqttConfig {
+        MqttConfig {
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port,
+            client_id: Some("smalog-test".into()),
+            qos: 1,
+            ..MqttConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn connects_with_a_last_will_and_announces_itself_online() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test port");
+        let port = listener.local_addr().expect("bound address").port();
+        let broker = tokio::spawn(fake_broker(listener));
+
+        let _publisher = Publisher::start(&config(port), "Plant", chrono_tz::UTC, "0.0.0-test")
+            .expect("publisher starts");
+
+        let (connect, publish) = tokio::time::timeout(std::time::Duration::from_secs(10), broker)
+            .await
+            .expect("the broker sees the client")
+            .expect("broker task");
+
+        assert_eq!(connect.client_id, "smalog-test");
+        assert_eq!(connect.keep_alive, KEEP_ALIVE_SECONDS);
+        let will = connect.last_will.expect("a last will is registered");
+        assert_eq!(will.topic, "smalog/bridge/availability");
+        assert_eq!(&will.message[..], b"offline");
+        assert!(will.retain);
+        assert_eq!(will.qos, QoS::AtLeastOnce);
+
+        assert_eq!(&publish.topic[..], b"smalog/bridge/availability");
+        assert_eq!(&publish.payload[..], b"online");
+        assert!(publish.retain);
+        assert_eq!(publish.qos, QoS::AtLeastOnce);
     }
 }

@@ -5,7 +5,7 @@ edition = "2021"
 description = "Localized SMA tag catalog for smalog"
 license = "EUPL-1.2"
 repository = "https://github.com/teian/smalog"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

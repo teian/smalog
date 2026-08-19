@@ -2,7 +2,7 @@
 name = "smalog-connection"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Shared SMA inverter connection library for SMA Data 2 Plus and legacy SMA-Data"
 license = "EUPL-1.2"
 

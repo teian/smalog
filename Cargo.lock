@@ -486,7 +486,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -534,6 +534,17 @@ name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "spin",
+]
+
+[[package]]
+name = "flume"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -1115,12 +1126,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqttbytes-core-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366b6ba2b4209ca4bc5ac731ccddf570d09831981eed07e5fbd63564cf0cf1aa"
+dependencies = [
+ "bytes",
+ "thiserror",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1440,19 +1461,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "rumqttc"
-version = "0.25.1"
+name = "rumqttc-core-next"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0feff8d882bff0b2fddaf99355a10336d43dd3ed44204f85ece28cf9626ab519"
+checksum = "249896ab27ed630590971738264baa8f722f18965d2e387c706c40a3c2a572cc"
+dependencies = [
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "rumqttc-v4-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3767dde22a804ea806107d0f4331e33cb794d1b8468b11c86fb0c1366f07054"
 dependencies = [
  "bytes",
  "fixedbitset",
- "flume",
+ "flume 0.12.0",
  "futures-util",
  "log",
+ "mqttbytes-core-next",
+ "rumqttc-core-next",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tokio-util",
 ]
 
@@ -1502,7 +1534,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1782,9 +1814,10 @@ dependencies = [
 name = "smalog-export"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "chrono-tz",
- "rumqttc",
+ "rumqttc-v4-next",
  "serde",
  "serde_json",
  "smalog-observation",
@@ -2059,7 +2092,7 @@ checksum = "c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"
 dependencies = [
  "atoi",
  "chrono",
- "flume",
+ "flume 0.11.1",
  "futures-channel",
  "futures-core",
  "futures-executor",
@@ -2143,7 +2176,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2595,7 +2628,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

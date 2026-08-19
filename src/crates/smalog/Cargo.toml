@@ -5,7 +5,7 @@ edition = "2021"
 description = "SMA inverter logger with storage, MQTT and a web dashboard"
 license = "EUPL-1.2"
 repository = "https://github.com/teian/smalog"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [features]
 # Embed the built web UI (src/ui/dist) into the binary and serve it.

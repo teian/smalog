@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Deterministic capacity benchmark for smalog schema v1"
 license = "EUPL-1.2"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [[bin]]
 name = "schema-v1-benchmark"

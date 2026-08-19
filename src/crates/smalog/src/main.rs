@@ -71,20 +71,46 @@ enum Command {
         end: NaiveDate,
     },
     /// Preflight or migrate an SBFspot schema-v1 SQLite database.
+    ///
+    /// Both endpoints are database URLs, not filesystem paths: an absolute
+    /// SQLite path therefore carries three slashes. The source is opened
+    /// read-only and never migrated in place, and the target must be a
+    /// distinct database that does not already hold smalog data.
+    ///
+    /// Stop every SBFspot writer and back the source up first, then run the
+    /// read-only preflight before the real migration:
+    ///
+    ///   smalog migrate-sbfspot \
+    ///     --source sqlite:///var/lib/sbfspot/SBFspot.db \
+    ///     --target sqlite:///var/lib/smalog/smalog.db \
+    ///     --timezone Europe/Berlin \
+    ///     --dry-run
+    ///
+    /// Repeat without --dry-run to migrate. Full backup, cutover and rollback
+    /// procedure: docs/migration-sbfspot.md.
+    #[command(visible_alias = "migrate", verbatim_doc_comment)]
     MigrateSbfspot {
-        /// Read-only SBFspot schema-version-1 SQLite source URL.
-        #[arg(long)]
+        /// Read-only SBFspot schema-version-1 SQLite source URL, e.g.
+        /// sqlite:///var/lib/sbfspot/SBFspot.db (three slashes for an
+        /// absolute path). MySQL sources must be converted to SQLite first.
+        #[arg(long, value_name = "URL")]
         source: String,
-        /// Distinct smalog schema-v1 SQLite or PostgreSQL target URL.
-        #[arg(long)]
+        /// Distinct smalog schema-v1 target URL, e.g.
+        /// sqlite:///var/lib/smalog/smalog.db or
+        /// postgres://user:password@host:5432/smalog. Must not be the source.
+        #[arg(long, value_name = "URL")]
         target: String,
-        /// Required IANA timezone used for legacy local-date conversion.
-        #[arg(long)]
+        /// IANA timezone of the plant, used to convert legacy timestamps to
+        /// local dates, e.g. Europe/Berlin. Must match the timezone
+        /// configured after cutover.
+        #[arg(long, value_name = "TZ")]
         timezone: String,
-        /// Run complete read-only preflight and do not migrate data.
+        /// Run the complete read-only preflight (schema version, row counts,
+        /// free space) and migrate nothing. Run this before every migration.
         #[arg(long, visible_alias = "preflight", conflicts_with = "verify_only")]
         dry_run: bool,
-        /// Resume an interrupted migration of this same source.
+        /// Resume an interrupted migration of this same source, keeping the
+        /// rows already written to the target.
         #[arg(long, conflicts_with = "verify_only")]
         resume: bool,
         /// Verify an existing migration without writing either database.

@@ -1,3 +1,16 @@
+smalog (0.3.0-1) unstable; urgency=medium
+
+  * Diagnostics: a query an inverter does not have is reported as
+    "not available" instead of "no answer", remembered per inverter, and
+    skipped from then on.
+  * Web dashboard: charts, cards and tables update in place; the periodic
+    refresh no longer blanks the view.
+  * New table inverter_query_support; the diagnostics ring is recreated on
+    first start because its outcome constraint gained a value.
+    Release notes: https://github.com/teian/smalog/releases
+
+ -- Frank Gehann <fg@fgehann.de>  Wed, 19 Aug 2026 14:00:00 +0000
+
 smalog (0.2.0-1) unstable; urgency=medium
 
   * Bluetooth: address data requests per inverter and reassemble replies

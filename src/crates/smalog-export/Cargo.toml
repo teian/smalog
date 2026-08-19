@@ -10,7 +10,11 @@ rust-version = "1.85"
 [dependencies]
 chrono = "0.4.45"
 chrono-tz = "0.10.4"
-rumqttc = "0.25.1"
+# Plain-TCP MQTT only: no TLS transport is configurable, and rumqttc's
+# default use-rustls feature pulls rustls-webpki 0.102, whose advisories
+# (GHSA-82j2-j2ch-gfr8 and three webpki name/CRL issues) are only fixed
+# in 0.103, a version no rumqttc release depends on yet.
+rumqttc = { version = "0.25.1", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 smalog-observation = { path = "../smalog-observation" }

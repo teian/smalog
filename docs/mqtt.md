@@ -18,6 +18,10 @@ All readings come from a single **metric registry**, so the leaf topics,
 the `attributes` metadata and the Home Assistant discovery configs are
 always consistent.
 
+The connection is **plain TCP**: there is no TLS transport and no
+certificate configuration. Use a broker on the local network, or tunnel
+the connection if it has to leave the host.
+
 ## How it works
 
 - One connection is opened at startup; it reconnects automatically on

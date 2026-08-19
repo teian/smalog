@@ -1,6 +1,6 @@
 [package]
 name = "smalog"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "SMA inverter logger with storage, MQTT and a web dashboard"
 license = "EUPL-1.2"

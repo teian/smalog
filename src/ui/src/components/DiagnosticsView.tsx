@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   CartesianGrid,
@@ -74,20 +74,33 @@ export function DiagnosticsView({
   const { locale, t } = useI18n();
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // What the tables on screen show. The 30-second refresh swaps their values;
+  // only a different day or inverter empties them, since keeping one
+  // inverter's rows under another's name would be wrong rather than merely
+  // stale.
+  const shownQuery = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setDiagnostics(null);
+    const query = `${date ?? ""}|${serial ?? "all"}`;
+    if (shownQuery.current !== query) {
+      setDiagnostics(null);
+    }
     setError(null);
     fetchDiagnostics(date, serial)
-      .then((data) => !cancelled && setDiagnostics(data))
+      .then((data) => {
+        if (cancelled) return;
+        shownQuery.current = query;
+        setDiagnostics(data);
+      })
       .catch((reason: unknown) => !cancelled && setError(String(reason)));
     return () => {
       cancelled = true;
     };
   }, [date, serial, refreshKey]);
 
-  if (error) {
+  // A failed refresh keeps the tables that are already up.
+  if (error && !diagnostics) {
     return (
       <p className="py-8 text-center text-sm text-muted-foreground">
         {t("loadError", { error })}

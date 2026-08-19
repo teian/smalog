@@ -12,7 +12,15 @@ import {
 } from "@/components/ui/popover";
 import { useI18n } from "@/lib/i18n";
 
-export function ServiceStatus({ status }: { status: Status | null }) {
+export function ServiceStatus({
+  status,
+  offline = false,
+}: {
+  status: Status | null;
+  /// The last poll did not reach the service. Its previous reading stays on
+  /// screen, so the badge is what says the numbers are no longer live.
+  offline?: boolean;
+}) {
   const { t } = useI18n();
 
   if (!status) {
@@ -22,6 +30,7 @@ export function ServiceStatus({ status }: { status: Status | null }) {
   return (
     <div className="flex min-w-0 items-center gap-1">
       <Badge variant="outline">v{status.version}</Badge>
+      {offline && <Badge variant="destructive">{t("offline")}</Badge>}
       {status.lastError && (
         <Popover>
           <PopoverTrigger asChild>

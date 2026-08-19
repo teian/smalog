@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   Bar,
@@ -93,10 +93,23 @@ export function HistoryChart({
   const [year, setYear] = useState<string | null>(null);
   const [currentYear, setCurrentYear] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
+  // The chart animates when it first appears. A periodic refresh replaces the
+  // data of a chart that is already on screen, and replaying the animation
+  // there reads as flicker.
+  const [animate, setAnimate] = useState(true);
+  // What the data on screen belongs to. A refresh keeps it and swaps the
+  // values underneath; a different range, inverter or period does not, since
+  // showing one period's data under another's heading would be a lie.
+  const shownQuery = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setHistory(null);
+    const query = [range, serial ?? "all", day, week, month, year].join("|");
+    const sameChart = shownQuery.current === query;
+    if (!sameChart) {
+      setHistory(null);
+      setAnimate(true);
+    }
     setError(null);
     const period =
       range === "day"
@@ -111,7 +124,11 @@ export function HistoryChart({
     fetchHistory(range, serial, false, period)
       .then((data) => {
         if (cancelled) return;
+        shownQuery.current = query;
         setHistory(data);
+        if (sameChart) {
+          setAnimate(false);
+        }
         if (range === "day" && data.date && day === null) {
           setDay(data.date);
         }
@@ -154,7 +171,7 @@ export function HistoryChart({
   const live = isDay && day !== null && day === today;
 
   let chart: ReactNode;
-  if (error) {
+  if (error && !history) {
     chart = (
       <p className="py-12 text-center text-sm text-muted-foreground">
         {t("loadError", { error })}
@@ -177,7 +194,13 @@ export function HistoryChart({
     );
   } else {
     if (isDay) {
-      chart = <DayHistoryChart history={history} allInverters={serial === null} />;
+      chart = (
+        <DayHistoryChart
+          history={history}
+          allInverters={serial === null}
+          animate={animate}
+        />
+      );
     } else if (range === "week") {
       chart = <WeekHistoryView history={history} />;
     } else if (range === "month") {
@@ -248,6 +271,7 @@ export function HistoryChart({
                 dataKey={dataKey}
                 fill={`var(--color-${dataKey})`}
                 radius={[4, 4, 0, 0]}
+                isAnimationActive={animate}
               />
             ))}
           </BarChart>
@@ -310,9 +334,13 @@ export function HistoryChart({
 function DayHistoryChart({
   history,
   allInverters,
+  animate,
 }: {
   history: History;
   allInverters: boolean;
+  /// False once the chart is on screen and only its data is being replaced,
+  /// so a refresh does not replay the entry animation.
+  animate: boolean;
 }) {
   const { locale, t } = useI18n();
   const availableSeries = useMemo(
@@ -545,6 +573,7 @@ function DayHistoryChart({
                 activeDot={{ r: 3 }}
                 connectNulls={false}
                 hide={hiddenSeries.has(item.key)}
+                isAnimationActive={animate}
                 animationDuration={500}
               />
             ) : (
@@ -561,6 +590,7 @@ function DayHistoryChart({
                 dot={false}
                 activeDot={{ r: 4, strokeWidth: 2 }}
                 hide={hiddenSeries.has(item.key)}
+                isAnimationActive={animate}
                 animationDuration={500}
               />
             ),

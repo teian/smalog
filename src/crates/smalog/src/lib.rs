@@ -13,6 +13,7 @@ pub mod config;
 pub mod daylight;
 pub mod diagnostics;
 pub mod error;
+pub mod query_support;
 pub mod service;
 
 /// Compatibility re-export of the canonical storage domain.

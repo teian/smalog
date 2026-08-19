@@ -719,11 +719,15 @@ async fn postgres_schema_v1_contract() {
         .await
         .expect("idempotent migration");
 
-    let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(migration_count, 1);
+    // Each migration applied exactly once, whatever their number: two racing
+    // startups must not double-apply one.
+    let (applied, distinct): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT version) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(applied >= 1, "the schema migrations must have run");
+    assert_eq!(applied, distinct, "a migration was applied twice");
     let metadata: Vec<(String, String)> =
         sqlx::query_as("SELECT key, value FROM schema_metadata ORDER BY key")
             .fetch_all(&pool)
@@ -754,6 +758,7 @@ async fn postgres_schema_v1_contract() {
             "inverter_energy_samples",
             "inverter_events",
             "inverter_measurements",
+            "inverter_query_support",
             "inverters",
             "migration_checkpoints",
             "migration_runs",

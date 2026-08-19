@@ -45,6 +45,8 @@ macro_rules! dispatch {
         }
     };
 }
+// Sibling repositories run the same statement against either backend.
+pub(crate) use dispatch;
 
 /// One serial an exchange addressed, answered, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]

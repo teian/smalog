@@ -19,6 +19,7 @@ use chrono_tz::Tz;
 use smalog::diagnostics::{CollectorSink, DiagnosticsWriter, RingBounds, Shutdown, WriteQueue};
 use smalog_connection::connection::{ClockMode, DeviceId, SyncOutcome, UserGroup};
 use smalog_connection::error::{Error, Result};
+use smalog_connection::RequestReply;
 use smalog_connection::{Collector, Connection, PollOptions};
 use smalog_storage::diagnostics::TransmissionFilter;
 use smalog_storage::storage::Db;
@@ -69,11 +70,14 @@ impl Connection for MockInverter {
         _first: u32,
         _last: u32,
         _events: bool,
-    ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+    ) -> Result<RequestReply> {
         if self.failing.load(Ordering::SeqCst) {
             return Err(Error::Timeout);
         }
-        Ok(HashMap::from([(2_100_123_456u32, vec![vec![0u8; 8]])]))
+        Ok(RequestReply::from_frames(HashMap::from([(
+            2_100_123_456u32,
+            vec![vec![0u8; 8]],
+        )])))
     }
 
     async fn end(&mut self) {}

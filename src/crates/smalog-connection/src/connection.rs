@@ -8,7 +8,7 @@
 //! transport. The generic [`crate::collector::Collector`] drives any
 //! connector through the poll sequence.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::error::{Error, Result};
 use crate::smadata2::commands::SMA_ERR_LRI_NOT_AVAILABLE;
@@ -75,6 +75,36 @@ pub enum SyncOutcome {
     Unsupported,
 }
 
+/// What one [`Connection::request_all`] produced.
+///
+/// A device that answers "LRI not available" (SMA error 21) contributes no
+/// frames, but that is a definitive answer — the value does not exist on
+/// that model — and not the silence of a device that failed to reply. The
+/// two are kept apart so the caller can report them differently and stop
+/// asking for what an inverter has already refused.
+#[derive(Debug, Default, Clone)]
+pub struct RequestReply {
+    /// Response frames (normalized ethernet datagrams) by device serial.
+    pub frames: HashMap<u32, Vec<Vec<u8>>>,
+    /// Serials that answered "LRI not available".
+    pub unsupported: BTreeSet<u32>,
+}
+
+impl RequestReply {
+    /// A reply carrying frames only.
+    pub fn from_frames(frames: HashMap<u32, Vec<Vec<u8>>>) -> RequestReply {
+        RequestReply {
+            frames,
+            unsupported: BTreeSet::new(),
+        }
+    }
+
+    /// Total number of frames across all devices.
+    pub fn total_frames(&self) -> usize {
+        self.frames.values().map(Vec::len).sum()
+    }
+}
+
 /// A transport session against one or more SMA inverters.
 ///
 /// Implementations include [`crate::speedwire::SpeedwireConnection`],
@@ -104,16 +134,15 @@ pub trait Connection: Send {
     /// Log on to every device.
     async fn login_all(&mut self) -> Result<()>;
 
-    /// Run one request against all devices and return the response frames
-    /// (normalized ethernet datagrams) grouped by device serial. A device
-    /// that answers "LRI not available" simply contributes no frames.
+    /// Run one request against all devices, returning their response frames
+    /// and the devices that answered "LRI not available".
     async fn request_all(
         &mut self,
         command: u32,
         first: u32,
         last: u32,
         events: bool,
-    ) -> Result<HashMap<u32, Vec<Vec<u8>>>>;
+    ) -> Result<RequestReply>;
 
     /// End the session (best effort; never fails the cycle).
     async fn end(&mut self);

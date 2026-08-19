@@ -180,7 +180,7 @@ below):
   range is a `400` naming the parameter, not a silent clamp.
 
 `/api/transmissions` additionally accepts `outcome` (`ok` | `empty` |
-`failed`), `target` (one collector endpoint) and `serial` (entries addressing
+`unsupported` | `failed`), `target` (one collector endpoint) and `serial` (entries addressing
 or answered by that inverter). `/api/logs` accepts `level` (that level and
 everything more severe) and `target` (a target prefix). Every filter is applied
 in SQL against an index, so a filter matching almost nothing costs no more than

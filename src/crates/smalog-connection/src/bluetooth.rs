@@ -29,7 +29,8 @@ use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 use crate::connection::{
-    encode_password, is_lri_not_available, ClockMode, Connection, DeviceId, SyncOutcome, UserGroup,
+    encode_password, is_lri_not_available, ClockMode, Connection, DeviceId, RequestReply,
+    SyncOutcome, UserGroup,
 };
 use crate::error::{Error, Result};
 use crate::smadata2::commands::{
@@ -81,6 +82,24 @@ struct RecvPacket {
     command: u16,
     is_l2: bool,
     fcs_ok: bool,
+}
+
+/// What one device answered to a data request.
+enum DeviceReply {
+    /// Response frames, normalized to ethernet-datagram shape.
+    Frames(Vec<Vec<u8>>),
+    /// SMA error 21: this device does not have the requested LRI. A
+    /// definitive answer, not a missing one.
+    Unsupported,
+}
+
+/// The replies to one broadcast round, keyed by device BT address.
+#[derive(Debug, Default)]
+pub struct BtRequestReply {
+    /// Response frames per device.
+    pub frames: HashMap<[u8; 6], Vec<Vec<u8>>>,
+    /// Devices that answered "LRI not available".
+    pub unsupported: Vec<[u8; 6]>,
 }
 
 /// The SMA Data 2 Plus framing/handshake/request engine, generic over the OS
@@ -579,16 +598,20 @@ impl<S: BtSocket> BtClient<S> {
         first: u32,
         last: u32,
         events: bool,
-    ) -> Result<HashMap<[u8; 6], Vec<Vec<u8>>>> {
-        let mut out: HashMap<[u8; 6], Vec<Vec<u8>>> = HashMap::new();
+    ) -> Result<BtRequestReply> {
+        let mut reply = BtRequestReply::default();
         let mut answered = false;
         for device in devices {
             match self.request_device(device, command, first, last, events) {
-                Ok(frames) => {
+                Ok(DeviceReply::Frames(frames)) => {
                     answered = true;
                     if !frames.is_empty() {
-                        out.insert(device.bt_address, frames);
+                        reply.frames.insert(device.bt_address, frames);
                     }
+                }
+                Ok(DeviceReply::Unsupported) => {
+                    answered = true;
+                    reply.unsupported.push(device.bt_address);
                 }
                 Err(Error::Timeout) => warn!(
                     device = device.mac(),
@@ -601,7 +624,7 @@ impl<S: BtSocket> BtClient<S> {
         if !answered {
             return Err(Error::Timeout);
         }
-        Ok(out)
+        Ok(reply)
     }
 
     /// One request to one device, retried up to [`MAX_RETRY`] times.
@@ -609,8 +632,7 @@ impl<S: BtSocket> BtClient<S> {
     /// Addressing follows SBFspot: the request carries the device's
     /// SUSyID/serial (never the `any` wildcards), spot values use control
     /// byte `0xA0` with the `addr_unknown` frame destination, and archive
-    /// commands use `0xE0` addressed to the inverter's own BT address. An
-    /// empty result means the device answered "LRI not available".
+    /// commands use `0xE0` addressed to the inverter's own BT address.
     fn request_device(
         &mut self,
         device: &BtDevice,
@@ -618,7 +640,7 @@ impl<S: BtSocket> BtClient<S> {
         first: u32,
         last: u32,
         events: bool,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<DeviceReply> {
         let archive = is_archive_command(command);
         let ctrl = if archive { 0xE0 } else { 0xA0 };
         let dest = if archive {
@@ -670,7 +692,7 @@ impl<S: BtSocket> BtClient<S> {
                 let err = get_ushort(&reply.pckt_buf, 23);
                 if err == SMA_ERR_LRI_NOT_AVAILABLE {
                     // A definitive answer: this device lacks the LRI.
-                    return Ok(Vec::new());
+                    return Ok(DeviceReply::Unsupported);
                 }
                 if err != 0 {
                     return Err(Error::Protocol(format!("SMA error code {err}")));
@@ -688,7 +710,7 @@ impl<S: BtSocket> BtClient<S> {
             }
 
             if got_any {
-                return Ok(frames);
+                return Ok(DeviceReply::Frames(frames));
             }
             retries -= 1;
             if retries == 0 {
@@ -965,28 +987,31 @@ impl<S: BtSocket> Connection for BluetoothConnection<S> {
         first: u32,
         last: u32,
         events: bool,
-    ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+    ) -> Result<RequestReply> {
         let by_addr = {
             let client = self.client.as_mut().ok_or_else(no_session)?;
             let devices = &self.devices;
             tokio::task::block_in_place(|| client.request(devices, command, first, last, events))
         };
         let by_addr = match by_addr {
-            Ok(m) => m,
-            Err(e) if is_lri_not_available(&e) => return Ok(HashMap::new()),
+            Ok(reply) => reply,
+            Err(e) if is_lri_not_available(&e) => return Ok(RequestReply::default()),
             Err(Error::Timeout) => {
                 warn!("bluetooth request timed out");
-                return Ok(HashMap::new());
+                return Ok(RequestReply::default());
             }
             Err(e) => return Err(e),
         };
-        let mut out = HashMap::new();
+        let mut reply = RequestReply::default();
         for dev in &self.devices {
-            if let Some(frames) = by_addr.get(&dev.bt_address) {
-                out.insert(dev.serial, frames.clone());
+            if let Some(frames) = by_addr.frames.get(&dev.bt_address) {
+                reply.frames.insert(dev.serial, frames.clone());
+            }
+            if by_addr.unsupported.contains(&dev.bt_address) {
+                reply.unsupported.insert(dev.serial);
             }
         }
-        Ok(out)
+        Ok(reply)
     }
 
     async fn end(&mut self) {

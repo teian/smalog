@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS poll_transmissions (
     last_lri        BIGINT,
     duration_ms     BIGINT NOT NULL CHECK (duration_ms >= 0),
     total_frames    BIGINT NOT NULL CHECK (total_frames >= 0),
-    outcome         TEXT NOT NULL CHECK (outcome IN ('ok', 'empty', 'failed')),
+    outcome         TEXT NOT NULL CHECK (outcome IN ('ok', 'empty', 'unsupported', 'failed')),
     -- Set only when outcome = 'failed'.
     error           TEXT,
     -- Note for a successful exchange, such as a clock-sync skip reason.
@@ -55,5 +55,5 @@ CREATE INDEX IF NOT EXISTS poll_transmission_devices_serial_id_idx
     ON poll_transmission_devices (serial_number, transmission_id DESC);
 
 INSERT INTO schema_metadata (key, value)
-VALUES ('diagnostics_version', '1')
+VALUES ('diagnostics_version', '2')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;

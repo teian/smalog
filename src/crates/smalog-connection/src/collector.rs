@@ -6,7 +6,7 @@
 //! single, transport-agnostic replacement for SBFspot's per-transport
 //! `Inverter::process()` loops.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,8 +14,9 @@ use chrono::{Datelike, Utc};
 use chrono_tz::Tz;
 use tracing::{debug, info, warn};
 
-use crate::connection::{ClockMode, Connection, SyncOutcome, UserGroup};
+use crate::connection::{ClockMode, Connection, RequestReply, SyncOutcome, UserGroup};
 use crate::error::Result;
+use crate::query_support::QuerySupportStore;
 use crate::smadata2::archive::{
     day_request_window, event_command, event_request_window, month_request_window,
     process_day_frames, process_event_frames, process_month_frames,
@@ -50,6 +51,12 @@ pub struct Collector {
     offsets_probed: bool,
     /// Optional diagnostics channel; `None` means nothing is recorded.
     sink: Option<Arc<dyn TransmissionSink>>,
+    /// Optional memory of the queries a device has refused; `None` means
+    /// every query is asked every cycle.
+    support: Option<Arc<dyn QuerySupportStore>>,
+    /// This session's refusals, loaded from `support` once the devices are
+    /// known: serial → query identifiers.
+    refused: HashMap<u32, BTreeSet<String>>,
 }
 
 impl Collector {
@@ -63,7 +70,18 @@ impl Collector {
             month_offsets: HashMap::new(),
             offsets_probed: false,
             sink: None,
+            support: None,
+            refused: HashMap::new(),
         }
+    }
+
+    /// Stop asking for values the inverters have already refused, remembering
+    /// them in `store` across restarts. Without it every query is sent every
+    /// cycle, as before.
+    #[must_use]
+    pub fn with_query_support(mut self, store: Arc<dyn QuerySupportStore>) -> Collector {
+        self.support = Some(store);
+        self
     }
 
     /// Build a collector that also reports every exchange to `sink`.
@@ -84,9 +102,11 @@ impl Collector {
 
     /// Time one connector request and record it as a transmission.
     ///
-    /// The request's result is returned unchanged, and nothing at all happens
-    /// when no sink is configured — including the device lookup and the
-    /// clock reads.
+    /// A query every addressed device has already refused is not sent at all:
+    /// it is reported as [`TransmissionOutcome::Unsupported`] and answered
+    /// with an empty reply. Otherwise the request's result is returned
+    /// unchanged, and with no sink configured nothing is recorded — including
+    /// the device lookup and the clock reads.
     async fn request_recorded(
         &mut self,
         kind: TransmissionKind,
@@ -94,16 +114,31 @@ impl Collector {
         first: u32,
         last: u32,
         events: bool,
-    ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+    ) -> Result<RequestReply> {
+        let mut addressed: Vec<u32> = self.connector.devices().iter().map(|d| d.serial).collect();
+        addressed.sort_unstable();
+
+        if self.every_device_refused(kind, &addressed) {
+            debug!(
+                query = kind.as_str(),
+                "skipping a query every device has refused"
+            );
+            self.record_skipped(kind, command, first, last, addressed);
+            return Ok(RequestReply::default());
+        }
+
         if self.sink.is_none() {
-            return self
+            let reply = self
                 .connector
                 .request_all(command, first, last, events)
                 .await;
+            if let Ok(reply) = &reply {
+                self.remember_refusals(kind, reply);
+            }
+            return reply;
         }
+
         let started_at_ms = Utc::now().timestamp_millis();
-        let mut addressed: Vec<u32> = self.connector.devices().iter().map(|d| d.serial).collect();
-        addressed.sort_unstable();
         let clock = Instant::now();
         let result = self
             .connector
@@ -122,10 +157,10 @@ impl Collector {
         transmission.command = Some(command);
         transmission.first_lri = Some(first);
         transmission.last_lri = Some(last);
-        transmission.addressed_serials = addressed;
+        transmission.addressed_serials = addressed.clone();
         match &result {
-            Ok(map) => {
-                for (serial, frames) in map {
+            Ok(reply) => {
+                for (serial, frames) in &reply.frames {
                     let count = u32::try_from(frames.len()).unwrap_or(u32::MAX);
                     if count > 0 {
                         transmission.frames_by_serial.insert(*serial, count);
@@ -136,8 +171,17 @@ impl Collector {
                     .values()
                     .fold(0u32, |sum, count| sum.saturating_add(*count));
                 if transmission.total_frames == 0 {
-                    transmission.outcome = TransmissionOutcome::Empty;
+                    // Every device refusing is an answer; anything else is
+                    // silence.
+                    transmission.outcome = if !addressed.is_empty()
+                        && addressed.iter().all(|s| reply.unsupported.contains(s))
+                    {
+                        TransmissionOutcome::Unsupported
+                    } else {
+                        TransmissionOutcome::Empty
+                    };
                 }
+                self.remember_refusals(kind, reply);
             }
             Err(error) => {
                 transmission.outcome = TransmissionOutcome::Failed;
@@ -148,6 +192,88 @@ impl Collector {
             sink.record(transmission);
         }
         result
+    }
+
+    /// True when every addressed device is known to lack `kind`, so asking
+    /// again would only cost a round trip.
+    fn every_device_refused(&self, kind: TransmissionKind, addressed: &[u32]) -> bool {
+        if self.support.is_none() || addressed.is_empty() {
+            return false;
+        }
+        let query = kind.as_str();
+        addressed.iter().all(|serial| {
+            self.refused
+                .get(serial)
+                .is_some_and(|queries| queries.contains(query))
+        })
+    }
+
+    /// Persist the refusals in `reply` and keep this session's set in step.
+    fn remember_refusals(&mut self, kind: TransmissionKind, reply: &RequestReply) {
+        let Some(store) = self.support.as_ref() else {
+            return;
+        };
+        let query = kind.as_str();
+        for serial in &reply.unsupported {
+            let model = self
+                .inverters
+                .iter()
+                .find(|inv| inv.serial == *serial)
+                .map(|inv| inv.device_type.clone())
+                .filter(|model| !model.is_empty());
+            store.remember(*serial, query, model.as_deref());
+            self.refused
+                .entry(*serial)
+                .or_default()
+                .insert(query.to_owned());
+        }
+    }
+
+    /// Record a query that was not sent because every device had refused it.
+    fn record_skipped(
+        &self,
+        kind: TransmissionKind,
+        command: u32,
+        first: u32,
+        last: u32,
+        addressed: Vec<u32>,
+    ) {
+        let Some(sink) = self.sink.as_ref() else {
+            return;
+        };
+        let (protocol, transport) = self.connector.communication();
+        let mut transmission = PollTransmission::step(
+            Utc::now().timestamp_millis(),
+            protocol,
+            transport,
+            kind,
+            0,
+            TransmissionOutcome::Unsupported,
+        );
+        transmission.command = Some(command);
+        transmission.first_lri = Some(first);
+        transmission.last_lri = Some(last);
+        transmission.addressed_serials = addressed;
+        sink.record(transmission);
+    }
+
+    /// Load the remembered refusals for the devices of this session.
+    fn load_refusals(&mut self) {
+        self.refused.clear();
+        let Some(store) = self.support.as_ref() else {
+            return;
+        };
+        for device in self.connector.devices() {
+            let queries = store.unsupported(device.serial);
+            if !queries.is_empty() {
+                debug!(
+                    serial = device.serial,
+                    queries = queries.len(),
+                    "skipping queries this inverter has refused before"
+                );
+                self.refused.insert(device.serial, queries);
+            }
+        }
     }
 
     /// Record one session step (begin, login, clock sync, end).
@@ -191,6 +317,7 @@ impl Collector {
     ) -> Result<Vec<InverterData>> {
         self.begin_recorded().await?;
         self.rebuild_inverters();
+        self.load_refusals();
 
         // Once begin() succeeds, always tear the session down. In particular,
         // a failed login must not leave Bluetooth or a partially logged-in
@@ -256,6 +383,7 @@ impl Collector {
     async fn probe_inner(&mut self, all: bool) -> Result<(Vec<InverterData>, usize)> {
         self.begin_recorded().await?;
         self.rebuild_inverters();
+        self.load_refusals();
 
         let result = match self.login_recorded().await {
             Ok(()) if all => Ok(self.query_sequence(false).await),
@@ -427,8 +555,8 @@ impl Collector {
                 return 0;
             }
         };
-        let received_frames = map.values().map(Vec::len).sum();
-        for (serial, frames) in map {
+        let received_frames = map.total_frames();
+        for (serial, frames) in map.frames {
             let Some(i) = self.index_of(serial) else {
                 continue;
             };
@@ -510,7 +638,7 @@ impl Collector {
         else {
             return;
         };
-        for (serial, frames) in map {
+        for (serial, frames) in map.frames {
             if !need.contains(&serial) {
                 continue;
             }
@@ -552,7 +680,7 @@ impl Collector {
                 return;
             }
         };
-        for (serial, frames) in map {
+        for (serial, frames) in map.frames {
             let (day, has) = process_day_frames(&frames, target_day, self.tz);
             if let Some(i) = self.index_of(serial) {
                 self.inverters[i].day_data = day;
@@ -576,7 +704,7 @@ impl Collector {
         else {
             return;
         };
-        for (serial, frames) in map {
+        for (serial, frames) in map.frames {
             let (md, has) = process_month_frames(&frames, now.month(), 0);
             let mut offset = 0i64;
             if has {
@@ -614,7 +742,7 @@ impl Collector {
                 )
                 .await
             {
-                for (serial, frames) in map {
+                for (serial, frames) in map.frames {
                     let off = self.month_offsets.get(&serial).copied().unwrap_or(0);
                     let (md, has) = process_month_frames(&frames, m, off);
                     if let Some(i) = self.index_of(serial) {
@@ -651,7 +779,7 @@ impl Collector {
                     )
                     .await
                 {
-                    for (serial, frames) in map {
+                    for (serial, frames) in map.frames {
                         let (events, e) = process_event_frames(&frames, group.code());
                         if let Some(i) = self.index_of(serial) {
                             self.inverters[i].event_data.extend(events);
@@ -782,9 +910,9 @@ mod tests {
             _first: u32,
             _last: u32,
             _events: bool,
-        ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+        ) -> Result<RequestReply> {
             self.state.requests.fetch_add(1, Ordering::SeqCst);
-            Ok(HashMap::new())
+            Ok(RequestReply::default())
         }
 
         async fn end(&mut self) {
@@ -819,7 +947,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingSink {
+    pub(super) struct RecordingSink {
         recorded: std::sync::Mutex<Vec<PollTransmission>>,
     }
 
@@ -835,7 +963,7 @@ mod tests {
                 .collect()
         }
 
-        fn of_kind(&self, kind: &str) -> Vec<PollTransmission> {
+        pub(super) fn of_kind(&self, kind: &str) -> Vec<PollTransmission> {
             self.all()
                 .into_iter()
                 .filter(|transmission| transmission.kind.as_str() == kind)
@@ -902,14 +1030,14 @@ mod tests {
             _first: u32,
             _last: u32,
             _events: bool,
-        ) -> Result<HashMap<u32, Vec<Vec<u8>>>> {
+        ) -> Result<RequestReply> {
             if self.fail_requests {
                 return Err(Error::Timeout);
             }
-            Ok(HashMap::from([
+            Ok(RequestReply::from_frames(HashMap::from([
                 (11u32, vec![vec![0u8; 8], vec![0u8; 8]]),
                 (22u32, vec![vec![0u8; 8]]),
-            ]))
+            ])))
         }
 
         async fn end(&mut self) {}
@@ -1089,5 +1217,196 @@ mod tests {
 
         assert_eq!(state.requests.load(Ordering::SeqCst), 13);
         assert_eq!(state.ended_sessions.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// Skipping the queries an inverter has refused, and telling that refusal
+/// apart from silence.
+#[cfg(test)]
+mod query_support_tests {
+    use super::tests::RecordingSink;
+    use super::*;
+    use crate::connection::DeviceId;
+    use crate::connection::SyncOutcome;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    const SERIAL: u32 = 2_100_123_456;
+
+    /// Answers every request with "LRI not available", counting the
+    /// requests that actually reached it.
+    struct RefusingConnector {
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Connection for RefusingConnector {
+        fn communication(
+            &self,
+        ) -> (
+            smalog_observation::ProtocolFamily,
+            smalog_observation::Transport,
+        ) {
+            (
+                smalog_observation::ProtocolFamily::SmaData2Plus,
+                smalog_observation::Transport::Bluetooth,
+            )
+        }
+
+        fn devices(&self) -> Vec<DeviceId> {
+            vec![DeviceId {
+                susy_id: 123,
+                serial: SERIAL,
+                address: "00:80:25:2E:45:D6".into(),
+            }]
+        }
+
+        fn user_group(&self) -> UserGroup {
+            UserGroup::User
+        }
+
+        async fn begin(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn login_all(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn request_all(
+            &mut self,
+            _command: u32,
+            _first: u32,
+            _last: u32,
+            _events: bool,
+        ) -> Result<RequestReply> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let mut reply = RequestReply::default();
+            reply.unsupported.insert(SERIAL);
+            Ok(reply)
+        }
+
+        async fn end(&mut self) {}
+
+        async fn set_clock(&mut self, _mode: ClockMode) -> Result<SyncOutcome> {
+            Ok(SyncOutcome::Unsupported)
+        }
+    }
+
+    /// Remembers refusals in memory, and counts what it was told.
+    #[derive(Default)]
+    struct MemoryStore {
+        refused: Mutex<HashMap<u32, BTreeSet<String>>>,
+        writes: AtomicUsize,
+    }
+
+    impl QuerySupportStore for MemoryStore {
+        fn unsupported(&self, serial: u32) -> BTreeSet<String> {
+            self.refused
+                .lock()
+                .expect("store lock")
+                .get(&serial)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn remember(&self, serial: u32, query: &str, _model: Option<&str>) {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.refused
+                .lock()
+                .expect("store lock")
+                .entry(serial)
+                .or_default()
+                .insert(query.to_owned());
+        }
+    }
+
+    fn collector(
+        requests: Arc<AtomicUsize>,
+        sink: Arc<RecordingSink>,
+        store: Arc<MemoryStore>,
+    ) -> Collector {
+        Collector::with_sink(
+            Box::new(RefusingConnector { requests }),
+            Tz::UTC,
+            PollOptions::default(),
+            sink,
+        )
+        .with_query_support(store)
+    }
+
+    #[tokio::test]
+    async fn a_refused_query_is_reported_as_unsupported_not_as_silence() {
+        let sink = Arc::new(RecordingSink::default());
+        let store = Arc::new(MemoryStore::default());
+        let mut collector = collector(Arc::new(AtomicUsize::new(0)), sink.clone(), store);
+
+        collector.cycle(false, None).await.expect("cycle");
+
+        let spot = sink.of_kind("spot.ac_total_power");
+        let first = spot.first().expect("the query was recorded");
+        assert_eq!(first.outcome, TransmissionOutcome::Unsupported);
+        assert_eq!(first.total_frames, 0);
+    }
+
+    #[tokio::test]
+    async fn a_remembered_refusal_is_not_asked_again() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(MemoryStore::default());
+
+        let mut first = collector(
+            requests.clone(),
+            Arc::new(RecordingSink::default()),
+            store.clone(),
+        );
+        first.cycle(false, None).await.expect("first cycle");
+        let asked_once = requests.load(Ordering::SeqCst);
+        assert!(asked_once > 0, "the first cycle has to ask");
+        let stored_writes = store.writes.load(Ordering::SeqCst);
+        assert!(stored_writes > 0, "refusals have to be remembered");
+
+        // A second collector over the same store: every query it would send
+        // is already known to be refused.
+        let sink = Arc::new(RecordingSink::default());
+        let mut second = collector(requests.clone(), sink.clone(), store.clone());
+        second.cycle(false, None).await.expect("second cycle");
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            asked_once,
+            "no request may reach an inverter that already refused"
+        );
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            stored_writes,
+            "a skipped query has nothing new to store"
+        );
+        let spot = sink.of_kind("spot.ac_total_power");
+        let skipped = spot.first().expect("the skipped query is still recorded");
+        assert_eq!(skipped.outcome, TransmissionOutcome::Unsupported);
+        assert_eq!(skipped.duration_ms, 0, "a skipped query costs no time");
+    }
+
+    #[tokio::test]
+    async fn without_a_store_every_query_is_asked_every_cycle() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mut collector = Collector::new(
+            Box::new(RefusingConnector {
+                requests: requests.clone(),
+            }),
+            Tz::UTC,
+            PollOptions::default(),
+        );
+
+        collector.cycle(false, None).await.expect("first cycle");
+        let first = requests.load(Ordering::SeqCst);
+        collector.cycle(false, None).await.expect("second cycle");
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            first * 2,
+            "with no memory configured the poll sequence is unchanged"
+        );
     }
 }

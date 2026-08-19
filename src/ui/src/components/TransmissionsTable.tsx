@@ -19,7 +19,22 @@ import {
   type RingView,
 } from "@/components/SystemView";
 
-const OUTCOMES: TransmissionOutcome[] = ["ok", "empty", "failed"];
+const OUTCOMES: TransmissionOutcome[] = [
+  "ok",
+  "empty",
+  "unsupported",
+  "failed",
+];
+
+/** The label key for one outcome. */
+const outcomeLabel = (outcome: TransmissionOutcome) =>
+  outcome === "ok"
+    ? "outcomeOk"
+    : outcome === "empty"
+      ? "outcomeEmpty"
+      : outcome === "unsupported"
+        ? "outcomeUnsupported"
+        : "outcomeFailed";
 
 /** SMA command and LRI window, rendered the way SBFspot and the SMA
  *  documentation write them, so a value can be compared against either. */
@@ -75,13 +90,7 @@ export function TransmissionsTable({
           <option value="">{t("allOutcomes")}</option>
           {OUTCOMES.map((value) => (
             <option key={value} value={value}>
-              {t(
-                value === "ok"
-                  ? "outcomeOk"
-                  : value === "empty"
-                    ? "outcomeEmpty"
-                    : "outcomeFailed",
-              )}
+              {t(outcomeLabel(value))}
             </option>
           ))}
         </select>
@@ -182,13 +191,7 @@ export function TransmissionsTable({
                                 : "outline"
                           }
                         >
-                          {t(
-                            entry.outcome === "ok"
-                              ? "outcomeOk"
-                              : entry.outcome === "empty"
-                                ? "outcomeEmpty"
-                                : "outcomeFailed",
-                          )}
+                          {t(outcomeLabel(entry.outcome))}
                         </Badge>
                         {(entry.error ?? entry.detail) && (
                           <span

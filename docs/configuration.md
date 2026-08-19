@@ -158,6 +158,7 @@ Bluetooth-only fields:
 |-----|------|---------|------------------------|
 | `address` | string | *(required)* | Unique inverter or repeater Bluetooth MAC, `aa:bb:cc:dd:ee:ff`. The serial is discovered during the Bluetooth handshake. |
 | `local_adapter` | string | *(optional)* | Local adapter MAC to bind to (multi-adapter hosts). |
+| `capture_file` | string | *(optional)* | Append every raw Bluetooth frame to this file for protocol debugging. Off unless set. See [bluetooth.md](bluetooth.md#raw-frame-capture). |
 | `mis_enabled` | bool | `false` | Enable the multi-inverter (MIS) network-build handshake / second MPP tracker. |
 | `synch_time` | integer (days) | `0` | Automatic inverter clock-sync cadence (SBFspot `SynchTime`). `0` disables it; `1` = daily, `7` = weekly, `30` = monthly. Must be `≤ 30`. Bluetooth only. See [bluetooth.md](bluetooth.md#clock-sync). |
 | `synch_time_low` | integer (seconds) | `60` | Lower drift bound (SBFspot `SynchTimeLow`): skip the sync when the inverter is off by this little or less. Must be `1`–`120` when `synch_time > 0`. |

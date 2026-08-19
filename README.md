@@ -344,8 +344,11 @@ journalctl -u smalog -f
 The supplied unit creates `/var/lib/smalog` as its state directory and
 loads `/etc/smalog/smalog.env`.
 
-For a Bluetooth setup, the hardened unit must additionally permit the
-Bluetooth address family:
+The supplied unit already permits `AF_BLUETOOTH`, so Bluetooth inverters
+need no further change. A unit installed before that fix still blocks the
+address family and fails with `socket(AF_BLUETOOTH): Address family not
+supported by protocol (os error 97)`. Reinstall the unit shown above, or
+add an override:
 
 ```bash
 sudo systemctl edit smalog
@@ -447,7 +450,8 @@ builds.
 | Ethernet inverter not found | Verify its fixed IP and UDP `9522`; multicast discovery also requires the same LAN/broadcast domain or host networking. |
 | Bluetooth `Host is down` | Ensure the inverter is awake and in range, the adapter is powered, and the MAC belongs to that inverter. |
 | Bluetooth `Device or resource busy` | Stop SBFspot, another smalog process, scans, or any process holding RFCOMM channel 1. |
-| Bluetooth fails only under systemd | Add `AF_BLUETOOTH` to `RestrictAddressFamilies` using the override above. |
+| Bluetooth: some queries answer, others time out | Record the raw frames with `test-bluetooth --capture <file>` (or `capture_file` in the config) and check the debug log — see [Bluetooth](docs/bluetooth.md#raw-frame-capture). |
+| Bluetooth `socket(AF_BLUETOOTH)`: `os error 97` under systemd | The installed unit lacks `AF_BLUETOOTH` in `RestrictAddressFamilies`; reinstall the unit or apply the override above. |
 | SQLite `unable to open database file` | Ensure `/var/lib/smalog` exists and is writable by the `smalog` user. |
 | `healthcheck` cannot connect | Set `service.listen`; verify the service is running and the selected port is not already in use. |
 | Dashboard returns 404 | Install a release binary or rebuild from source with `pnpm run build` and Cargo feature `ui`. |

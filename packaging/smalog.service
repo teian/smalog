@@ -25,7 +25,9 @@ ReadWritePaths=/var/lib/smalog
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_BLUETOOTH is required by Bluetooth inverters (RFCOMM); without it
+# socket(2) fails with EAFNOSUPPORT.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_BLUETOOTH
 
 [Install]
 WantedBy=multi-user.target

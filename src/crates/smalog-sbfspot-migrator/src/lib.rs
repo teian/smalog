@@ -1087,12 +1087,34 @@ fn target_query_error(context: &str, error: sqlx::Error) -> Error {
     ))
 }
 
+/// Whether a `--source`/`--target` value is a bare filesystem path rather than
+/// a database URL. Both connectors dispatch on the scheme, so a path reaches
+/// engine detection with nothing to detect; distinguishing the two lets the
+/// error name the missing scheme instead of quoting the path as an engine.
+fn looks_like_filesystem_path(url: &str) -> bool {
+    !url.contains(':') || url.starts_with('/') || url.starts_with('.')
+}
+
+/// The `sqlite://` URL for a filesystem path. An absolute path keeps its
+/// leading slash, which is why a correct absolute source URL has three.
+fn sqlite_url_for(path: &str) -> String {
+    format!("sqlite://{path}")
+}
+
 pub(crate) fn sqlite_source_path(url: &str) -> Result<PathBuf> {
     if !url.starts_with("sqlite:") {
+        if looks_like_filesystem_path(url) {
+            return Err(Error::Migration(format!(
+                "SBFspot source {url:?} is a filesystem path, not a database URL; pass it with \
+                 the SQLite scheme, e.g. {:?}",
+                sqlite_url_for(url)
+            )));
+        }
         let engine = url.split(':').next().unwrap_or("unknown");
         return Err(Error::Migration(format!(
             "unsupported SBFspot source engine {engine:?}; initial migration support requires a \
-             read-only SQLite schema-version-1 source URL"
+             read-only SQLite schema-version-1 source URL such as \
+             \"sqlite:///var/lib/sbfspot/SBFspot.db\""
         )));
     }
     let options = SqliteConnectOptions::from_str(url).map_err(Error::Database)?;
@@ -1145,9 +1167,18 @@ pub(crate) fn parse_target(url: &str) -> Result<Target> {
             .map(Target::Postgres)
             .map_err(Error::Database);
     }
+    if looks_like_filesystem_path(url) {
+        return Err(Error::Migration(format!(
+            "migration target {url:?} is a filesystem path, not a database URL; pass it with the \
+             SQLite scheme, e.g. {:?}",
+            sqlite_url_for(url)
+        )));
+    }
     let engine = url.split(':').next().unwrap_or("unknown");
     Err(Error::Migration(format!(
-        "unsupported smalog target engine {engine:?}; use SQLite or PostgreSQL"
+        "unsupported smalog target engine {engine:?}; use a SQLite URL \
+         (\"sqlite:///var/lib/smalog/smalog.db\") or a PostgreSQL URL \
+         (\"postgres://user:password@host:5432/smalog\")"
     )))
 }
 
@@ -1171,6 +1202,64 @@ mod tests {
             .to_string()
             .contains("unsupported SBFspot source engine"));
         assert!(error.to_string().contains("read-only SQLite"));
+    }
+
+    #[tokio::test]
+    async fn bare_source_path_names_the_missing_scheme() {
+        let error = preflight(&MigrateOptions {
+            source: "/home/pi/smadata/SBFspot.db".into(),
+            target: "sqlite:///tmp/smalog.db".into(),
+            timezone: "UTC".into(),
+            mode: MigrationMode::Preflight,
+            daily_statistics: false,
+            pvoutput_state: None,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("is a filesystem path, not a database URL"),
+            "{error}"
+        );
+        assert!(
+            error.contains("\"sqlite:///home/pi/smadata/SBFspot.db\""),
+            "{error}"
+        );
+        assert!(!error.contains("engine"), "{error}");
+    }
+
+    #[test]
+    fn bare_target_path_names_the_missing_scheme() {
+        let error = parse_target("/var/lib/smalog/smalog.db")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is a filesystem path, not a database URL"),
+            "{error}"
+        );
+        assert!(
+            error.contains("\"sqlite:///var/lib/smalog/smalog.db\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unsupported_target_engine_shows_both_supported_url_forms() {
+        let error = parse_target("mysql://localhost/smalog")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsupported smalog target engine \"mysql\""),
+            "{error}"
+        );
+        assert!(
+            error.contains("sqlite:///var/lib/smalog/smalog.db"),
+            "{error}"
+        );
+        assert!(
+            error.contains("postgres://user:password@host:5432/smalog"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

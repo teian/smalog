@@ -20,3 +20,6 @@ tokio = { version = "1.52.3", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# The tests are async; without this the crate only compiles as part of a
+# workspace build that happens to unify tokio's macros feature from a sibling.
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }

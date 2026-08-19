@@ -186,6 +186,20 @@ pub const CMD_ARCHIVE_EVENTS_USER: u32 = 0x7010_0200;
 /// Event-log request command, installer group.
 pub const CMD_ARCHIVE_EVENTS_INSTALLER: u32 = 0x7012_0200;
 
+/// True for the archive commands (day, month, event log). SBFspot sends
+/// those with control byte `0xE0` and addresses the L1 frame to the
+/// inverter itself, while spot-value requests use `0xA0` and the
+/// `addr_unknown` broadcast destination.
+pub fn is_archive_command(command: u32) -> bool {
+    matches!(
+        command,
+        CMD_ARCHIVE_DAY
+            | CMD_ARCHIVE_MONTH
+            | CMD_ARCHIVE_EVENTS_USER
+            | CMD_ARCHIVE_EVENTS_INSTALLER
+    )
+}
+
 /// Login command.
 pub const CMD_LOGIN: u32 = 0xFFFD_040C;
 /// Logoff command.

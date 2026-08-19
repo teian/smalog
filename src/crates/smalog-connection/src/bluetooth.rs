@@ -8,6 +8,7 @@
 //! byte layout as an ethernet datagram, so all decode/archive code is
 //! reused unchanged (see `normalize_l2`).
 
+pub mod capture;
 pub mod frame;
 mod socket;
 
@@ -21,21 +22,24 @@ mod windows;
 pub use socket::{to_wire_order, BtSocket, PlatformSocket};
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::connection::{
     encode_password, is_lri_not_available, ClockMode, Connection, DeviceId, SyncOutcome, UserGroup,
 };
 use crate::error::{Error, Result};
 use crate::smadata2::commands::{
-    CMD_IDENTIFY, CMD_LOGIN, CMD_LOGOFF, MAX_RETRY, SMA_ERR_INVALID_PASSWORD,
+    is_archive_command, CMD_IDENTIFY, CMD_LOGIN, CMD_LOGOFF, MAX_RETRY, SMA_ERR_INVALID_PASSWORD,
     SMA_ERR_LRI_NOT_AVAILABLE,
 };
 use crate::speedwire::packet::{
     gen_session_id, get_long, get_ulong, get_ushort, ANY_SERIAL, ANY_SUSYID, ETH_L2SIGNATURE,
 };
+use capture::{Capture, Direction};
 use frame::{fcs16, unescape, FrameWriter, BTH_L2SIGNATURE};
 
 const BT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -88,6 +92,8 @@ pub struct BtClient<S: BtSocket> {
     root: [u8; 6],
     app_serial: u32,
     pckt_id: u16,
+    /// Raw-frame capture, when the session enabled one.
+    capture: Option<Arc<Capture>>,
 }
 
 impl<S: BtSocket> BtClient<S> {
@@ -95,6 +101,16 @@ impl<S: BtSocket> BtClient<S> {
     /// MACs (as written in the config). The socket converts them to its
     /// native form; the frame headers use LSB-first wire order.
     pub fn connect(dest: [u8; 6], local: Option<[u8; 6]>) -> Result<BtClient<S>> {
+        Self::connect_with_capture(dest, local, None)
+    }
+
+    /// As [`connect`](Self::connect), recording every L1 frame into
+    /// `capture` when one is given.
+    pub fn connect_with_capture(
+        dest: [u8; 6],
+        local: Option<[u8; 6]>,
+        capture: Option<Arc<Capture>>,
+    ) -> Result<BtClient<S>> {
         let sock = S::connect(dest, local, BT_TIMEOUT)?;
         Ok(BtClient {
             sock,
@@ -102,7 +118,16 @@ impl<S: BtSocket> BtClient<S> {
             root: to_wire_order(dest),
             app_serial: gen_session_id(),
             pckt_id: 0,
+            capture,
         })
+    }
+
+    /// Send one L1 frame, recording it first when capturing.
+    fn send_frame(&mut self, frame: &[u8]) -> Result<()> {
+        if let Some(capture) = &self.capture {
+            capture.record(Direction::Tx, frame);
+        }
+        self.sock.send(frame)
     }
 
     fn next_pckt_id(&mut self) -> u16 {
@@ -119,7 +144,21 @@ impl<S: BtSocket> BtClient<S> {
     /// getPacket: read one frame whose L1 command matches `wait4cmd`
     /// (from the expected `sender`, wildcarded by 0xFF bytes). A
     /// `wait4cmd` of 0xFF accepts the next frame regardless.
+    ///
+    /// An L2 reply longer than one Bluetooth frame is split over several
+    /// L1 frames: the first carries `0x7E` + [`BTH_L2SIGNATURE`], the
+    /// continuations carry raw payload bytes behind their own 18-byte L1
+    /// header and may use a different L1 command. Their bodies are
+    /// accumulated *still escaped* — an escape pair can straddle a frame
+    /// boundary — until the closing `0x7E` delimiter arrives; only the
+    /// complete packet is de-escaped and FCS-checked. SBFspot does the
+    /// same: its `index`/`hasL2pckt` survive the read loop, so fragments
+    /// append instead of replacing each other.
     fn get_packet(&mut self, sender: [u8; 6], wait4cmd: u16) -> Result<RecvPacket> {
+        // Escaped L2 bytes gathered so far; empty means no packet in flight.
+        let mut l2: Vec<u8> = Vec::new();
+        // L1 command of the frame that opened the packet in flight.
+        let mut l2_command = 0u16;
         loop {
             let header = self.sock.read_exact(18)?;
             let pk_len = u16::from_le_bytes([header[1], header[2]]) as usize;
@@ -131,21 +170,46 @@ impl<S: BtSocket> BtClient<S> {
             if pk_len > 18 {
                 frame.extend_from_slice(&self.sock.read_exact(pk_len - 18)?);
             }
+            if let Some(capture) = &self.capture {
+                capture.record(Direction::Rx, &frame);
+            }
 
             let valid_sender = sender
                 .iter()
                 .zip(source.iter())
                 .all(|(&s, &a)| s == a || s == 0xFF);
 
-            let is_l2 =
-                frame.len() > 22 && frame[18] == 0x7E && get_ulong(&frame, 19) == BTH_L2SIGNATURE;
+            let body_end = pk_len.clamp(18, frame.len());
+            let body = &frame[18..body_end];
+            let starts_l2 =
+                body.len() > 4 && body[0] == 0x7E && get_ulong(body, 1) == BTH_L2SIGNATURE;
 
-            let (pckt_buf, fcs_ok) = if is_l2 {
-                let de = deescape_l2(&frame, pk_len);
+            if starts_l2 {
+                if !l2.is_empty() {
+                    debug!(
+                        pending = l2.len(),
+                        "bt: dropping truncated L2 packet, a new one starts"
+                    );
+                }
+                l2.clear();
+                l2_command = command;
+                l2.extend_from_slice(body);
+            } else if !l2.is_empty() {
+                trace!(command, len = body.len(), "bt: L2 continuation frame");
+                l2.extend_from_slice(body);
+            }
+
+            // The closing 0x7E is written raw while payload 0x7E bytes are
+            // escaped as 7D 5E, so a trailing 0x7E ends the packet.
+            let (pckt_buf, is_l2, fcs_ok) = if l2.is_empty() {
+                (frame.clone(), false, true)
+            } else if l2.len() > 5 && l2[l2.len() - 1] == 0x7E {
+                let de = unescape(&l2);
                 let ok = validate_fcs(&de);
-                (de, ok)
+                l2.clear();
+                (de, true, ok)
             } else {
-                (frame.clone(), true)
+                continue; // Packet incomplete — read the next fragment.
             };
 
             let pkt = RecvPacket {
@@ -157,11 +221,14 @@ impl<S: BtSocket> BtClient<S> {
             };
 
             // Loop condition (SBFspot): repeat while (command mismatch OR
-            // bad sender) AND not wildcard.
+            // bad sender) AND not wildcard. A reassembled packet also
+            // matches on the command of its opening frame, since only one
+            // of the two carries the command the caller waits for.
             if wait4cmd == WILDCARD_CMD {
                 return Ok(pkt);
             }
-            if valid_sender && command == wait4cmd {
+            let command_matches = command == wait4cmd || (pkt.is_l2 && l2_command == wait4cmd);
+            if valid_sender && command_matches {
                 return Ok(pkt);
             }
             trace!(command, want = wait4cmd, valid_sender, "bt: skipping frame");
@@ -255,7 +322,7 @@ impl<S: BtSocket> BtClient<S> {
         w.byte(net_id);
         w.long(0);
         w.long(1);
-        self.sock.send(&w.finish())?;
+        self.send_frame(&w.finish())?;
 
         let reply = self.get_packet(self.root, 0x0005)?;
         if reply.pckt_buf.len() >= 32 {
@@ -268,7 +335,7 @@ impl<S: BtSocket> BtClient<S> {
             w.long(0);
             w.long(0);
         });
-        self.sock.send(&frame)?;
+        self.send_frame(&frame)?;
 
         let mut identified = None;
         for _ in 0..MAX_RETRY {
@@ -313,7 +380,7 @@ impl<S: BtSocket> BtClient<S> {
         for b in [b'v', b'e', b'r', 13, 10] {
             w.byte(b);
         }
-        self.sock.send(&w.finish())?;
+        self.send_frame(&w.finish())?;
         let hello = self.get_packet(self.root, 0x0002)?;
         let net_id = hello.pckt_buf.get(22).copied().unwrap_or(0);
         if hello.pckt_buf.get(19).copied().unwrap_or(0) < 4 {
@@ -328,7 +395,7 @@ impl<S: BtSocket> BtClient<S> {
         w.byte(net_id);
         w.long(0);
         w.long(1);
-        self.sock.send(&w.finish())?;
+        self.send_frame(&w.finish())?;
         let a = self.get_packet(self.root, 0x000A)?;
         if a.pckt_buf.get(24).copied() == Some(2) && a.pckt_buf.len() >= 24 {
             self.root.copy_from_slice(&a.pckt_buf[18..24]);
@@ -353,7 +420,7 @@ impl<S: BtSocket> BtClient<S> {
                 if let Some(b) = extra {
                     w.byte(b);
                 }
-                self.sock.send(&w.finish())?;
+                self.send_frame(&w.finish())?;
                 let _ = self.get_packet(self.root, 0x0004)?;
             }
             // Wait for the network to come up (up to 6 frames).
@@ -390,7 +457,7 @@ impl<S: BtSocket> BtClient<S> {
             w.long(0);
             w.long(0);
         });
-        self.sock.send(&frame)?;
+        self.send_frame(&frame)?;
         for _ in 0..devices.len() {
             let id = match self.get_packet([0xFF; 6], 0x0001) {
                 Ok(p) => p,
@@ -435,7 +502,7 @@ impl<S: BtSocket> BtClient<S> {
             w.long(0);
             w.array(&pw);
         });
-        self.sock.send(&frame)?;
+        self.send_frame(&frame)?;
 
         let mut confirmed = 0usize;
         // Read one reply per inverter; verify pcktID + echoed timestamp.
@@ -492,16 +559,19 @@ impl<S: BtSocket> BtClient<S> {
             w.long(CMD_LOGOFF);
             w.long(0xFFFF_FFFF);
         });
-        self.sock.send(&frame) // no reply expected
+        self.send_frame(&frame) // no reply expected
     }
 
     // ------------------------------------------------------------------
     // Data request
 
-    /// Send one broadcast request and gather every matching reply frame,
-    /// grouped by source BT address and normalized to ethernet-datagram
-    /// shape (ready for `Datagram::parse`). `events` selects the 16-bit
-    /// fragment counter.
+    /// Query every device in turn and return their reply frames, grouped
+    /// by BT address and normalized to ethernet-datagram shape (ready for
+    /// `Datagram::parse`). `events` selects the 16-bit fragment counter.
+    ///
+    /// Returns `Err(Timeout)` only when no device answered at all; a
+    /// single silent inverter is logged and skipped so the others still
+    /// deliver data.
     pub fn request(
         &mut self,
         devices: &[BtDevice],
@@ -510,48 +580,97 @@ impl<S: BtSocket> BtClient<S> {
         last: u32,
         events: bool,
     ) -> Result<HashMap<[u8; 6], Vec<Vec<u8>>>> {
+        let mut out: HashMap<[u8; 6], Vec<Vec<u8>>> = HashMap::new();
+        let mut answered = false;
+        for device in devices {
+            match self.request_device(device, command, first, last, events) {
+                Ok(frames) => {
+                    answered = true;
+                    if !frames.is_empty() {
+                        out.insert(device.bt_address, frames);
+                    }
+                }
+                Err(Error::Timeout) => warn!(
+                    device = device.mac(),
+                    command = format!("{command:#010X}"),
+                    "bt: inverter did not answer"
+                ),
+                Err(e) => return Err(e),
+            }
+        }
+        if !answered {
+            return Err(Error::Timeout);
+        }
+        Ok(out)
+    }
+
+    /// One request to one device, retried up to [`MAX_RETRY`] times.
+    ///
+    /// Addressing follows SBFspot: the request carries the device's
+    /// SUSyID/serial (never the `any` wildcards), spot values use control
+    /// byte `0xA0` with the `addr_unknown` frame destination, and archive
+    /// commands use `0xE0` addressed to the inverter's own BT address. An
+    /// empty result means the device answered "LRI not available".
+    fn request_device(
+        &mut self,
+        device: &BtDevice,
+        command: u32,
+        first: u32,
+        last: u32,
+        events: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let archive = is_archive_command(command);
+        let ctrl = if archive { 0xE0 } else { 0xA0 };
+        let dest = if archive {
+            device.bt_address
+        } else {
+            [0xFF; 6]
+        };
+
         let mut retries = MAX_RETRY;
         loop {
-            let frame = self.build_l2(0x09, 0xA0, 0, ANY_SUSYID, ANY_SERIAL, &|w| {
-                w.long(command);
-                w.long(first);
-                w.long(last);
-            });
-            self.sock.send(&frame)?;
+            let frame =
+                self.build_l2_dest(dest, 0x09, ctrl, 0, device.susy_id, device.serial, &|w| {
+                    w.long(command);
+                    w.long(first);
+                    w.long(last);
+                });
+            self.send_frame(&frame)?;
 
-            let mut out: HashMap<[u8; 6], Vec<Vec<u8>>> = HashMap::new();
-            let mut done: HashMap<[u8; 6], bool> = HashMap::new();
+            let mut frames: Vec<Vec<u8>> = Vec::new();
             let mut got_any = false;
 
             loop {
-                let reply = match self.get_packet([0xFF; 6], 0x0001) {
+                let reply = match self.get_packet(device.bt_address, 0x0001) {
                     Ok(p) => p,
                     Err(Error::Timeout) => break,
                     Err(e) => return Err(e),
                 };
                 if !reply.is_l2 || !reply.fcs_ok {
+                    debug!(
+                        is_l2 = reply.is_l2,
+                        fcs_ok = reply.fcs_ok,
+                        len = reply.pckt_buf.len(),
+                        "bt: dropping reply frame"
+                    );
                     continue;
                 }
                 if reply.pckt_buf.len() < 28 {
+                    debug!(len = reply.pckt_buf.len(), "bt: dropping short reply");
                     continue;
                 }
                 if get_ushort(&reply.pckt_buf, 27) & 0x7FFF != self.pckt_id {
+                    debug!(
+                        got = get_ushort(&reply.pckt_buf, 27) & 0x7FFF,
+                        want = self.pckt_id,
+                        "bt: dropping stale reply (pcktID mismatch)"
+                    );
                     continue; // stale response
                 }
                 let err = get_ushort(&reply.pckt_buf, 23);
                 if err == SMA_ERR_LRI_NOT_AVAILABLE {
-                    // This inverter lacks the requested LRI — a definitive
-                    // answer. Skip it (no frames) without failing the whole
-                    // broadcast, so the other inverters' replies still count.
-                    got_any = true;
-                    done.insert(reply.source_addr, true);
-                    if devices
-                        .iter()
-                        .all(|d| done.get(&d.bt_address).copied().unwrap_or(false))
-                    {
-                        break;
-                    }
-                    continue;
+                    // A definitive answer: this device lacks the LRI.
+                    return Ok(Vec::new());
                 }
                 if err != 0 {
                     return Err(Error::Protocol(format!("SMA error code {err}")));
@@ -562,29 +681,21 @@ impl<S: BtSocket> BtClient<S> {
                 } else {
                     reply.pckt_buf[25] as u32
                 };
-                out.entry(reply.source_addr)
-                    .or_default()
-                    .push(normalize_l2(&reply.pckt_buf));
+                frames.push(normalize_l2(&reply.pckt_buf));
                 if frag_left == 0 {
-                    done.insert(reply.source_addr, true);
-                    // Stop once every known device has finished.
-                    if devices
-                        .iter()
-                        .all(|d| done.get(&d.bt_address).copied().unwrap_or(false))
-                    {
-                        break;
-                    }
+                    break;
                 }
             }
 
             if got_any {
-                return Ok(out);
+                return Ok(frames);
             }
             retries -= 1;
             if retries == 0 {
                 return Err(Error::Timeout);
             }
             warn!(
+                device = device.mac(),
                 command = format!("{command:#010X}"),
                 "bt request timeout, retrying"
             );
@@ -610,7 +721,7 @@ impl<S: BtSocket> BtClient<S> {
             w.long(1);
             w.long(1);
         });
-        self.sock.send(&read)?;
+        self.send_frame(&read)?;
         let reply = self.get_packet([0xFF; 6], 0x0001)?;
         if !reply.fcs_ok {
             return Err(Error::Protocol("clock read FCS mismatch".into()));
@@ -670,7 +781,7 @@ impl<S: BtSocket> BtClient<S> {
             w.long(next_count);
             w.long(1);
         });
-        self.sock.send(&write)?;
+        self.send_frame(&write)?;
 
         // Verify: re-read; success if current ≈ last-set (SBFspot < 5 s).
         let (v_curr, v_last, _, _) = self.read_plant_time()?;
@@ -701,7 +812,7 @@ impl<S: BtSocket> BtClient<S> {
             w.long(1);
             w.long(1);
         });
-        self.sock.send(&write)?;
+        self.send_frame(&write)?;
         Ok(SyncOutcome::Set)
     }
 }
@@ -731,6 +842,8 @@ pub struct BluetoothParams {
     pub tz_offset: i32,
     /// Host DST flag (0/1) for the blind `-settime2` write.
     pub dst: i32,
+    /// Optional path for a raw L1 frame capture (see [`capture`]).
+    pub capture: Option<PathBuf>,
 }
 
 /// Bluetooth (RFCOMM) connector, generic over the OS socket [`BtSocket`]
@@ -747,6 +860,27 @@ fn device_id(d: &BtDevice) -> DeviceId {
         susy_id: d.susy_id,
         serial: d.serial,
         address: d.mac(),
+    }
+}
+
+/// Open the configured capture file. A capture is a debugging aid, so a
+/// failure is logged and the session continues without one.
+fn open_capture(path: Option<&std::path::Path>, peer: [u8; 6]) -> Option<Arc<Capture>> {
+    let path = path?;
+    let peer = peer
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    match Capture::create(path, &peer) {
+        Ok(capture) => {
+            info!(path = %path.display(), "bluetooth raw capture enabled");
+            Some(Arc::new(capture))
+        }
+        Err(e) => {
+            warn!(error = %e, "bluetooth raw capture disabled");
+            None
+        }
     }
 }
 
@@ -770,7 +904,12 @@ impl<S: BtSocket> BluetoothConnection<S> {
 /// socket — the `discover` command. Blocking; run it off the async
 /// executor.
 pub fn enumerate(params: &BluetoothParams) -> Result<Vec<DeviceId>> {
-    let mut client = BtClient::<PlatformSocket>::connect(params.address, params.local_adapter)?;
+    let capture = open_capture(params.capture.as_deref(), params.address);
+    let mut client = BtClient::<PlatformSocket>::connect_with_capture(
+        params.address,
+        params.local_adapter,
+        capture,
+    )?;
     let devices = client.init(params.mis_enabled)?;
     Ok(devices.iter().map(device_id).collect())
 }
@@ -801,8 +940,9 @@ impl<S: BtSocket> Connection for BluetoothConnection<S> {
         let address = self.params.address;
         let local = self.params.local_adapter;
         let mis = self.params.mis_enabled;
+        let capture = open_capture(self.params.capture.as_deref(), address);
         let (client, devices) = tokio::task::block_in_place(|| -> Result<_> {
-            let mut client = BtClient::<S>::connect(address, local)?;
+            let mut client = BtClient::<S>::connect_with_capture(address, local, capture)?;
             let devices = client.init(mis)?;
             Ok((client, devices))
         })?;
@@ -897,16 +1037,6 @@ fn parse_topology(pckt_buf: &[u8], net_id: u8) -> Vec<BtDevice> {
     devices
 }
 
-/// De-escape an L2 frame body (`CommBuf[18..pk_len]`) into pcktBuf; the
-/// leading 0x7E is kept (pcktBuf[0] == 0x7E).
-fn deescape_l2(comm: &[u8], pk_len: usize) -> Vec<u8> {
-    let end = pk_len.min(comm.len());
-    if end <= 18 {
-        return Vec::new();
-    }
-    unescape(&comm[18..end])
-}
-
 /// validateChecksum: FCS over pcktBuf[1..len-3], compared with the LE u16
 /// at len-3.
 fn validate_fcs(p: &[u8]) -> bool {
@@ -967,5 +1097,205 @@ mod normalization_tests {
         assert_eq!(normalized.len(), packet.len() + 14);
         assert_eq!(&normalized[normalized.len() - 4..], &[0; 4]);
         assert!(datagram.records().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reassembly_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    /// Replays a canned byte stream; reading past its end times out, just
+    /// like a silent inverter.
+    pub(super) struct ScriptedSocket {
+        stream: RefCell<VecDeque<u8>>,
+        pub(super) sent: RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl ScriptedSocket {
+        fn new(bytes: &[u8]) -> ScriptedSocket {
+            ScriptedSocket {
+                stream: RefCell::new(bytes.iter().copied().collect()),
+                sent: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BtSocket for ScriptedSocket {
+        fn connect(_: [u8; 6], _: Option<[u8; 6]>, _: Duration) -> Result<ScriptedSocket> {
+            unreachable!("tests build the socket directly")
+        }
+
+        fn send(&self, data: &[u8]) -> Result<()> {
+            self.sent.borrow_mut().push(data.to_vec());
+            Ok(())
+        }
+
+        fn read_exact(&self, n: usize) -> Result<Vec<u8>> {
+            let mut stream = self.stream.borrow_mut();
+            if stream.len() < n {
+                return Err(Error::Timeout);
+            }
+            Ok(stream.drain(..n).collect())
+        }
+    }
+
+    pub(super) fn client(bytes: &[u8]) -> BtClient<ScriptedSocket> {
+        BtClient {
+            sock: ScriptedSocket::new(bytes),
+            local: [0; 6],
+            root: [0; 6],
+            app_serial: 1,
+            pckt_id: 1,
+            capture: None,
+        }
+    }
+
+    /// An 18-byte L1 header for a frame of `len` total bytes.
+    fn l1_header(len: usize, command: u16) -> Vec<u8> {
+        let mut h = vec![0u8; 18];
+        h[0] = 0x7E;
+        h[1] = (len & 0xFF) as u8;
+        h[2] = (len >> 8) as u8;
+        h[3] = h[0] ^ h[1] ^ h[2];
+        h[16] = (command & 0xFF) as u8;
+        h[17] = (command >> 8) as u8;
+        h
+    }
+
+    /// A complete, FCS-valid L2 reply frame; the payload contains bytes
+    /// that must be escaped so splitting can straddle an escape pair.
+    fn l2_reply() -> Vec<u8> {
+        let mut w = FrameWriter::new(0x0001, &[0; 6], &[0; 6]);
+        w.l2_header(0x09, 0xA0, 0, ANY_SUSYID, ANY_SERIAL, 1, 1);
+        w.long(0x7E7D_1213);
+        w.long(0x0025_1E00);
+        w.trailer();
+        w.finish()
+    }
+
+    #[test]
+    fn single_frame_l2_reply_is_accepted() {
+        let frame = l2_reply();
+        let mut c = client(&frame);
+        let pkt = c.get_packet([0xFF; 6], 0x0001).expect("frame read");
+        assert!(pkt.is_l2);
+        assert!(pkt.fcs_ok);
+        assert_eq!(pkt.pckt_buf[0], 0x7E);
+    }
+
+    #[test]
+    fn l2_reply_split_over_two_l1_frames_is_reassembled() {
+        let frame = l2_reply();
+        let body = &frame[18..];
+        // Split directly after an escape marker, so the escape pair itself
+        // straddles the frame boundary.
+        let split = body.iter().position(|&b| b == 0x7D).expect("escaped byte") + 1;
+
+        let mut wire = l1_header(18 + split, 0x0008);
+        wire.extend_from_slice(&body[..split]);
+        let mut tail = l1_header(18 + body.len() - split, 0x0001);
+        tail.extend_from_slice(&body[split..]);
+        wire.extend_from_slice(&tail);
+
+        let mut c = client(&wire);
+        let pkt = c.get_packet([0xFF; 6], 0x0001).expect("reassembled frame");
+        assert!(pkt.is_l2);
+        assert!(pkt.fcs_ok, "FCS must validate over the reassembled packet");
+
+        let whole = client(&frame)
+            .get_packet([0xFF; 6], 0x0001)
+            .expect("single frame");
+        assert_eq!(pkt.pckt_buf, whole.pckt_buf);
+    }
+
+    #[test]
+    fn fragment_carrying_the_awaited_command_first_is_still_returned() {
+        let frame = l2_reply();
+        let body = &frame[18..];
+        let split = body.len() / 2;
+
+        // Opening fragment carries command 0x0001, the closing one 0x0008.
+        let mut wire = l1_header(18 + split, 0x0001);
+        wire.extend_from_slice(&body[..split]);
+        let mut tail = l1_header(18 + body.len() - split, 0x0008);
+        tail.extend_from_slice(&body[split..]);
+        wire.extend_from_slice(&tail);
+
+        let mut c = client(&wire);
+        let pkt = c.get_packet([0xFF; 6], 0x0001).expect("reassembled frame");
+        assert!(pkt.is_l2);
+        assert!(pkt.fcs_ok);
+    }
+
+    #[test]
+    fn an_incomplete_l2_packet_times_out_instead_of_looping() {
+        let frame = l2_reply();
+        let body = &frame[18..];
+        let mut wire = l1_header(18 + body.len() - 4, 0x0008);
+        wire.extend_from_slice(&body[..body.len() - 4]);
+
+        let mut c = client(&wire);
+        assert!(matches!(
+            c.get_packet([0xFF; 6], 0x0001),
+            Err(Error::Timeout)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod addressing_tests {
+    use super::reassembly_tests::*;
+    use super::*;
+    use crate::smadata2::commands::CMD_ARCHIVE_DAY;
+
+    fn device() -> BtDevice {
+        BtDevice {
+            bt_address: [0xD6, 0x45, 0x2E, 0x25, 0x80, 0x00],
+            susy_id: 0x009D,
+            serial: 2_100_123_456,
+        }
+    }
+
+    /// The request as it went on the wire: L1 frame destination, L2
+    /// control byte and the addressed SUSyID/serial.
+    fn sent_request(command: u32) -> ([u8; 6], u8, u16, u32) {
+        let device = device();
+        // An empty stream times out, so the request gives up after
+        // MAX_RETRY attempts and leaves its frames behind.
+        let mut client = client(&[]);
+        let _ = client.request_device(&device, command, 0, 0xFF, false);
+        let frames = client.sock.sent.borrow().clone();
+        assert_eq!(frames.len(), MAX_RETRY as usize);
+
+        let frame = &frames[0];
+        let mut dest = [0u8; 6];
+        dest.copy_from_slice(&frame[10..16]);
+        let body = frame::unescape(&frame[19..]);
+        (
+            dest,
+            body[5],
+            u16::from_le_bytes([body[6], body[7]]),
+            u32::from_le_bytes([body[8], body[9], body[10], body[11]]),
+        )
+    }
+
+    #[test]
+    fn spot_requests_address_the_device_and_broadcast_the_frame() {
+        let (dest, ctrl, susy_id, serial) = sent_request(0x5100_0200);
+        assert_eq!(dest, [0xFF; 6], "spot values use the addr_unknown frame");
+        assert_eq!(ctrl, 0xA0);
+        assert_eq!(susy_id, device().susy_id, "never the anySUSyID wildcard");
+        assert_eq!(serial, device().serial, "never the anySerial wildcard");
+    }
+
+    #[test]
+    fn archive_requests_are_addressed_to_the_inverter_with_control_e0() {
+        let (dest, ctrl, susy_id, serial) = sent_request(CMD_ARCHIVE_DAY);
+        assert_eq!(dest, device().bt_address);
+        assert_eq!(ctrl, 0xE0);
+        assert_eq!(susy_id, device().susy_id);
+        assert_eq!(serial, device().serial);
     }
 }

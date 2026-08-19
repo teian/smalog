@@ -21,7 +21,7 @@ COPY src/ui/ ./
 RUN pnpm run build
 
 # --- Rust service --------------------------------------------------------
-FROM rust:1.93-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 
 WORKDIR /build
 

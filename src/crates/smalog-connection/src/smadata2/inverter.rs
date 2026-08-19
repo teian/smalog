@@ -378,7 +378,7 @@ impl InverterData {
         let vtype = if vtype > 5 {
             '?'
         } else {
-            [b'N', b'E', b'A', b'B', b'R', b'S'][vtype] as char
+            b"NEABRS"[vtype] as char
         };
         let vbuild = (version >> 8) & 0xFF;
         let vminor = (version >> 16) & 0xFF; // BCD

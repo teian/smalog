@@ -35,8 +35,12 @@ export default function App() {
   // Kept in App so the choice survives leaving and re-entering the area.
   const [systemTab, setSystemTab] = useState<SystemTab>("transmissions");
   const [refreshKey, setRefreshKey] = useState(0);
+  // The last poll failed. The data stays on screen; only the badge changes.
+  const [offline, setOffline] = useState(false);
 
-  // Poll live status every 30 s.
+  // Poll live status every 30 s. The cards and charts update in place — a
+  // failed poll keeps the last reading on screen rather than emptying the
+  // page, which would flicker once every time the network hiccups.
   useEffect(() => {
     let active = true;
     const load = () =>
@@ -44,9 +48,10 @@ export default function App() {
         .then((s) => {
           if (!active) return;
           setStatus(s);
+          setOffline(false);
           setRefreshKey((value) => value + 1);
         })
-        .catch(() => active && setStatus(null));
+        .catch(() => active && setOffline(true));
     load();
     const timer = setInterval(load, 30_000);
     return () => {
@@ -111,7 +116,7 @@ export default function App() {
             <option value="en">{t("english")}</option>
             <option value="de">{t("german")}</option>
           </select>
-          <ServiceStatus status={status} />
+          <ServiceStatus status={status} offline={offline} />
         </div>
       </header>
 

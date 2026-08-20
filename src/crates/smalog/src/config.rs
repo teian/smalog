@@ -58,6 +58,10 @@ pub struct ArchiveConfig {
     pub event_months: u32,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_one() -> u32 {
     1
 }
@@ -91,6 +95,11 @@ pub struct ServiceConfig {
     /// from voltage × current.
     #[serde(default)]
     pub calc_missing_spot: bool,
+    /// Show inverter temperature in the dashboard's day view. Inverters
+    /// without a temperature sensor answer "LRI not available", leaving the
+    /// column empty; set this to false to drop it entirely.
+    #[serde(default = "default_true")]
+    pub show_temperature: bool,
     /// Poll household consumption from the inverter's consumer-power LRIs
     /// and fill the `Consumption` table. Off by default: SBFspot never
     /// queries these (its `Consumption` table is written by external
@@ -127,6 +136,7 @@ impl Default for ServiceConfig {
             listen: None,
             poll_at_night: false,
             calc_missing_spot: false,
+            show_temperature: true,
             poll_consumption: false,
             transmission_log_retention_hours: default_diagnostics_retention_hours(),
             application_log_retention_hours: default_diagnostics_retention_hours(),

@@ -262,6 +262,7 @@ impl Service {
                 diagnostics: self.diagnostics.clone(),
                 transmission_ring: self.transmission_ring,
                 log_buffer: self.log_buffer.clone(),
+                show_temperature: self.config.service.show_temperature,
             };
             tokio::spawn(async move {
                 if let Err(e) = serve_http(addr, state).await {
@@ -619,6 +620,10 @@ struct ApiState {
     diagnostics: Arc<WriteQueue>,
     transmission_ring: RingBounds,
     log_buffer: Arc<LogBuffer>,
+    /// Whether the day view carries inverter temperature at all. Inverters
+    /// without a temperature sensor answer "LRI not available", and a column
+    /// of dashes for every reading is noise the operator can switch off.
+    show_temperature: bool,
 }
 
 impl ApiState {
@@ -632,6 +637,7 @@ impl ApiState {
             diagnostics: WriteQueue::new(crate::diagnostics::QUEUE_CAPACITY),
             transmission_ring: RingBounds::new(48, 50_000),
             log_buffer: LogBuffer::new(48, 50_000),
+            show_temperature: true,
         }
     }
 }
@@ -1046,6 +1052,7 @@ async fn history_handler(
         },
         params.serial,
         params.strings,
+        state.show_temperature,
     )
     .await
     {
@@ -1265,6 +1272,7 @@ fn parse_history_year(raw: Option<&str>) -> std::result::Result<Option<i32>, Str
 /// `month`, and `year` select a local calendar period. `strings` (day + serial)
 /// splits DC power per string. The result is `{ range, unit, keys, rows }`
 /// where each row is `{ label, <key>: value, … }` ready for the chart.
+#[allow(clippy::too_many_arguments)]
 async fn build_history(
     db: &Db,
     tz: Tz,
@@ -1272,6 +1280,7 @@ async fn build_history(
     period: HistoryPeriod,
     serial: Option<u32>,
     strings: bool,
+    show_temperature: bool,
 ) -> Result<Value> {
     use chrono::{Datelike, Duration, TimeZone, Timelike};
 
@@ -1353,10 +1362,13 @@ async fn build_history(
                 let mut series = Vec::new();
                 let total_power_key = "total_power".to_string();
                 let total_energy_key = "total_energy".to_string();
+                // The aggregate view has no temperature series of its own;
+                // averaging sensors across inverters would invent a reading.
                 let total_rows = build_day_metric_rows(
                     db.day_metrics(start, start + 86_400, None).await?,
                     db.day_power(start, start + 86_400, None).await?,
                     tz,
+                    false,
                 );
 
                 merge_inverter_day_rows(
@@ -1395,6 +1407,7 @@ async fn build_history(
                         db.day_power(start, start + 86_400, Some(inverter_serial))
                             .await?,
                         tz,
+                        show_temperature,
                     );
 
                     merge_inverter_day_rows(&mut merged_rows, rows, &power_key, &energy_key);
@@ -1439,7 +1452,7 @@ async fn build_history(
 
             let samples = db.day_metrics(start, start + 86_400, serial).await?;
             let power = db.day_power(start, start + 86_400, serial).await?;
-            let rows = build_day_metric_rows(samples, power, tz);
+            let rows = build_day_metric_rows(samples, power, tz, show_temperature);
             let previous_energy = previous_day_energy(db, tz, selected_day, serial).await?;
             let summary = build_day_summary(&rows, "power", "energy", previous_energy);
 
@@ -1449,12 +1462,8 @@ async fn build_history(
                 "today": today.to_string(),
                 "live": selected_day == today,
                 "unit": "mixed",
-                "keys": ["power", "energy", "temperature"],
-                "series": [
-                    { "key": "power", "label": "Power", "metric": "power" },
-                    { "key": "energy", "label": "Energy Generated", "metric": "energy" },
-                    { "key": "temperature", "label": "Temperature", "metric": "temperature" },
-                ],
+                "keys": day_keys(show_temperature),
+                "series": day_series(show_temperature),
                 "summary": summary,
                 "rows": rows,
             });
@@ -1896,10 +1905,36 @@ fn merge_inverter_day_rows(
     }
 }
 
+/// The keys of a single-inverter day payload.
+fn day_keys(show_temperature: bool) -> Vec<&'static str> {
+    if show_temperature {
+        vec!["power", "energy", "temperature"]
+    } else {
+        vec!["power", "energy"]
+    }
+}
+
+/// The series of a single-inverter day payload.
+fn day_series(show_temperature: bool) -> Vec<Value> {
+    let mut series = vec![
+        json!({ "key": "power", "label": "Power", "metric": "power" }),
+        json!({ "key": "energy", "label": "Energy Generated", "metric": "energy" }),
+    ];
+    if show_temperature {
+        series.push(json!({
+            "key": "temperature",
+            "label": "Temperature",
+            "metric": "temperature",
+        }));
+    }
+    series
+}
+
 fn build_day_metric_rows(
     samples: Vec<DayMetricSample>,
     power_samples: Vec<DayPowerSample>,
     tz: Tz,
+    show_temperature: bool,
 ) -> Vec<Value> {
     use chrono::{TimeZone, Timelike};
 
@@ -1981,12 +2016,15 @@ fn build_day_metric_rows(
             let temperature = (point.temperature_count > 0)
                 .then(|| point.temperature_sum / point.temperature_count as f64);
             let power_w = archive_power.get(&ts).copied().unwrap_or(point.power_w);
-            Some(json!({
+            let mut row = json!({
                 "label": format!("{:02}:{:02}", t.hour(), t.minute()),
                 "power": power_w as f64 / 1000.0,
                 "energy": point.energy_wh as f64 / 1000.0,
-                "temperature": temperature,
-            }))
+            });
+            if show_temperature {
+                row["temperature"] = json!(temperature);
+            }
+            Some(row)
         })
         .collect()
 }
@@ -3119,6 +3157,7 @@ mod tests {
             ],
             vec![(0, 1, 900), (0, 2, 1_800), (300, 1, 1_400)],
             Tz::UTC,
+            true,
         );
 
         assert_eq!(rows[0]["power"], 2.7);
@@ -3127,6 +3166,27 @@ mod tests {
         assert_eq!(rows[1]["power"], 1.4);
         assert_eq!(rows[1]["energy"], 31.0);
         assert_eq!(rows[1]["temperature"], 21.5);
+    }
+
+    #[test]
+    fn day_rows_carry_no_temperature_when_it_is_switched_off() {
+        let samples = vec![(0, 1, 1_000, 10_000, Some(20.0))];
+        let power = vec![(0, 1, 900)];
+
+        let shown = build_day_metric_rows(samples.clone(), power.clone(), Tz::UTC, true);
+        assert_eq!(shown[0]["temperature"], 20.0);
+        assert_eq!(
+            crate::service::day_keys(true),
+            vec!["power", "energy", "temperature"]
+        );
+        assert_eq!(crate::service::day_series(true).len(), 3);
+
+        // Off: the field is absent rather than null, so the dashboard has no
+        // column to draw and no dashes to fill it with.
+        let hidden = build_day_metric_rows(samples, power, Tz::UTC, false);
+        assert!(hidden[0].get("temperature").is_none());
+        assert_eq!(crate::service::day_keys(false), vec!["power", "energy"]);
+        assert_eq!(crate::service::day_series(false).len(), 2);
     }
 
     #[test]

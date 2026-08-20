@@ -89,7 +89,9 @@ export interface History {
   keys: string[];
   series?: HistorySeries[];
   summary?: DaySummary | WeekSummary | MonthSummary | YearSummary;
-  rows: Array<Record<string, string | number>>;
+  // A metric an inverter does not report comes back as null, which is not
+  // the same as zero.
+  rows: Array<Record<string, string | number | null>>;
 }
 
 export interface DiagnosticMppt {

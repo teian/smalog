@@ -9,7 +9,7 @@ import {
   formatNumber,
   formatPowerKilowatts,
 } from "@/lib/format";
-import { aggregateHistorySeries } from "@/lib/history";
+import { aggregateHistorySeries, numericValue } from "@/lib/history";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import {
@@ -55,7 +55,10 @@ export function DayHistoryTables({
     [series, selectedLabel],
   );
   const rows = useMemo(() => [...history.rows].reverse(), [history.rows]);
-  const showTemperature = summaries.some((item) => item.temperatureKey);
+  // A column of dashes says nothing: show it only where a reading exists.
+  const showTemperature = summaries.some(
+    (item) => latestValue(history, item.temperatureKey) !== null,
+  );
 
   return (
     <div className="flex flex-col gap-4">
@@ -241,11 +244,6 @@ function latestValue(history: History, key?: string): number | null {
     if (value !== null) return value;
   }
   return null;
-}
-
-function numericValue(value: string | number | undefined): number | null {
-  const numeric = Number(value);
-  return value === undefined || !Number.isFinite(numeric) ? null : numeric;
 }
 
 function formatMetric(

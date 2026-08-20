@@ -19,3 +19,17 @@ export function aggregateHistorySeries(
       (item.key === "power" || item.key === "energy"),
   );
 }
+
+/** One row value as a number, or null when the metric is absent.
+ *
+ *  A metric the inverter does not report arrives as `null`, and `Number(null)`
+ *  is `0` — which is how a missing temperature came to be shown as 0.00 °C. */
+export function numericValue(
+  value: string | number | null | undefined,
+): number | null {
+  if (value === null || value === undefined) return null;
+  // `Number("")` is 0 as well; an empty cell is not a reading either.
+  if (typeof value === "string" && value.trim() === "") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}

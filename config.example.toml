@@ -23,7 +23,12 @@ listen = "0.0.0.0:8080"
 # Poll around the clock instead of only between sunrise and sunset.
 poll_at_night = false
 # Derive missing Pdc/Pac from voltage x current (SBFspot CalcMissingSpot).
+# Set this if a tracker shows 0 W beside a real DC voltage and current:
+# older inverters such as the SB 2500 never report DC power.
 calc_missing_spot = false
+# Show inverter temperature in the day view. Inverters without a sensor
+# leave the column empty; false drops it entirely.
+show_temperature = true
 # Poll household consumption from the inverter's consumer-power LRIs and
 # fill the Consumption table. Off by default and only useful with an SMA
 # consumption meter attached; inverters without one report "LRI not

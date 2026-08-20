@@ -4,7 +4,7 @@ import {
   formatNumber,
   formatPowerKilowatts,
 } from "@/lib/format";
-import { aggregateHistorySeries } from "@/lib/history";
+import { aggregateHistorySeries, numericValue } from "@/lib/history";
 import { HistoryMetricCard } from "@/components/MonthHistoryView";
 import { useI18n } from "@/lib/i18n";
 
@@ -96,7 +96,3 @@ function inferSeries(history: History): HistorySeries[] {
   }));
 }
 
-function numericValue(value: string | number | undefined): number | null {
-  const numeric = Number(value);
-  return value === undefined || !Number.isFinite(numeric) ? null : numeric;
-}

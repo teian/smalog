@@ -344,6 +344,27 @@ what stdout already receives) but it is new reach. Keep the dashboard behind a
 reverse proxy if it is exposed, and set
 `service.application_log_retention_hours = 0` to switch capture off entirely.
 
+### A tracker shows 0 W with voltage and current present
+
+Some inverters never report DC power (`DcMsWatt`) — the SB 2500 is one. Their
+string power is stored as zero, so the device statistics show `0,00 W` beside a
+perfectly real `372,00 V` and `1,24 A`, and the average efficiency stays empty
+because it has no DC side to divide by.
+
+That is what `service.calc_missing_spot` is for: with it set, Pdc is derived as
+`Udc × Idc`, exactly as SBFspot's `CalculateMissingSpotValues` does. It also
+fills per-phase Pac and, from those, the total.
+
+```toml
+[service]
+calc_missing_spot = true
+```
+
+The service logs the hint once per inverter when it sees voltage and current
+without power. Whether the inverter answered the query at all is visible under
+**System → Transmissions**, filtered to `spot.dc_power`: `nicht verfügbar`
+means it refused, `ok` means it answered — with zeros.
+
 ## The poll loop
 
 ### Wall-clock-aligned ticks

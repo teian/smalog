@@ -362,6 +362,20 @@ impl InverterData {
         self.configured_name.as_deref().unwrap_or(&self.device_name)
     }
 
+    /// True when a tracker reports DC voltage and current but no DC power.
+    ///
+    /// Some inverters — the SB 2500 among them — never send `DcMsWatt`. Their
+    /// DC power is then stored as zero, which reads as "the string produced
+    /// nothing" even though voltage times current says otherwise. SBFspot
+    /// calls that a missing value and derives it (`CalculateMissingSpotValues`
+    /// / `service.calc_missing_spot`), so this is what the collector points at
+    /// when the option is off.
+    pub fn dc_power_missing(&self) -> bool {
+        self.mpp
+            .values()
+            .any(|tracker| tracker.pdc == 0 && tracker.udc > 0 && tracker.idc > 0)
+    }
+
     /// CalcMissingSpot + calPacTot/calEfficiency (SBFspot Inverter.cpp).
     pub fn calc_derived(&mut self) {
         self.cal_pac_tot = self.pac1 + self.pac2 + self.pac3;
@@ -392,5 +406,41 @@ impl InverterData {
             vbuild,
             vtype
         )
+    }
+}
+
+/// The DC-power gap some inverters leave, and what the collector makes of it.
+#[cfg(test)]
+mod dc_power_tests {
+    use super::*;
+
+    fn with_tracker(pdc: i32, udc: i32, idc: i32) -> InverterData {
+        let mut inv = InverterData::new(String::new());
+        inv.mpp.insert(1, Mppt { pdc, udc, idc });
+        inv
+    }
+
+    #[test]
+    fn voltage_and_current_without_power_is_a_missing_value() {
+        // The SB 2500 in the field: 372.00 V, 1.24 A, no DcMsWatt.
+        assert!(with_tracker(0, 37_200, 1_240).dc_power_missing());
+    }
+
+    #[test]
+    fn a_string_that_is_genuinely_dark_is_not_a_missing_value() {
+        assert!(!with_tracker(0, 0, 0).dc_power_missing());
+    }
+
+    #[test]
+    fn a_reported_power_is_not_missing() {
+        assert!(!with_tracker(461, 37_200, 1_240).dc_power_missing());
+    }
+
+    #[test]
+    fn deriving_it_matches_sbfspots_arithmetic() {
+        let mut inv = with_tracker(0, 37_200, 1_240);
+        crate::collector::calc_missing_spot(&mut inv);
+        assert_eq!(inv.mpp[&1].pdc, 461);
+        assert!(!inv.dc_power_missing());
     }
 }

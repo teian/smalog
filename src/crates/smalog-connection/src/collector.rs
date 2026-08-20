@@ -57,6 +57,9 @@ pub struct Collector {
     /// This session's refusals, loaded from `support` once the devices are
     /// known: serial → query identifiers.
     refused: HashMap<u32, BTreeSet<String>>,
+    /// Serials already told about their missing DC power, so the hint is
+    /// logged once per process instead of once per poll cycle.
+    dc_power_hinted: BTreeSet<u32>,
 }
 
 impl Collector {
@@ -72,6 +75,7 @@ impl Collector {
             sink: None,
             support: None,
             refused: HashMap::new(),
+            dc_power_hinted: BTreeSet::new(),
         }
     }
 
@@ -605,6 +609,15 @@ impl Collector {
         for inv in &mut self.inverters {
             if calc {
                 calc_missing_spot(inv);
+            } else if inv.dc_power_missing() && self.dc_power_hinted.insert(inv.serial) {
+                // Silently storing zero would look like a dead string, and
+                // the number to fix it is one the operator has to set.
+                warn!(
+                    serial = inv.serial,
+                    "inverter reports DC voltage and current but no DC power; \
+                     set service.calc_missing_spot = true to derive it (SBFspot \
+                     CalculateMissingSpotValues)"
+                );
             }
             inv.calc_derived();
         }
